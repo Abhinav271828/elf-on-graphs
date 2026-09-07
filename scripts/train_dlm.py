@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 
 from spelf import common, dataset as ds, dlm as dlm_module, metrics, viz
 from spelf.encoder import load_frozen_encoder
-from spelf.t5_encoder import load_t5_encoder
+from spelf import t5_encoder
 
 
 def infinite_loader(loader: DataLoader):
@@ -31,16 +31,23 @@ def main():
     p.add_argument("--data_dir", type=str, default="data")
     p.add_argument("--encoder_kind", type=str, default="custom", choices=["custom", "t5"],
                     help="'custom' conditions on this project's own pretrained GraphEncoder "
-                         "(--encoder_ckpt required). 't5' conditions on a frozen pretrained "
-                         "HuggingFace T5 encoder over a text serialization of the graph instead "
-                         "(--encoder_ckpt ignored; see --t5_model_name).")
+                         "(--encoder_ckpt required), diffusing in that encoder's own "
+                         "(from-scratch-pretrained) embedding space. 't5' conditions on a "
+                         "frozen pretrained HuggingFace T5 encoder over a text serialization "
+                         "of the graph AND diffuses directly in T5's own frozen embedding "
+                         "space -- matching the canonical ELF implementation's actual use of "
+                         "T5 (arXiv:2605.10938) -- rather than merely using T5 as a "
+                         "conditioning source (--encoder_ckpt ignored; see --t5_model_name, "
+                         "and t5_encoder.T5DiffusionEncoder's docstring).")
     p.add_argument("--encoder_ckpt", type=str, default=None,
                     help="required when --encoder_kind=custom")
     p.add_argument("--t5_model_name", type=str, default="t5-small",
-                    help="HuggingFace T5 checkpoint name, used when --encoder_kind=t5")
-    p.add_argument("--d_model", type=int, default=128,
-                    help="only used when --encoder_kind=t5 (custom mode infers d_model "
-                         "from --encoder_ckpt)")
+                    help="HuggingFace T5 checkpoint name, used when --encoder_kind=t5. "
+                         "--encoder_kind=t5 diffuses directly in this model's own frozen "
+                         "embedding space (see t5_encoder.T5DiffusionEncoder) -- d_model "
+                         "is therefore always this T5 model's own hidden size, not a free "
+                         "choice; there is no --d_model flag here (custom mode infers its "
+                         "d_model from --encoder_ckpt the same way).")
     p.add_argument("--run_dir", type=str, default="runs/dlm")
     p.add_argument("--resume", type=str, default="latest")
     p.add_argument("--seed", type=int, default=0)
@@ -109,10 +116,16 @@ def main():
         d_model = encoder.d_model
         print(f"loaded frozen custom encoder from {args.encoder_ckpt} (d_model={d_model})")
     else:
-        encoder = load_t5_encoder(args.t5_model_name, args.d_model, device)
+        # Diffuses directly in T5's own frozen embedding space (see
+        # t5_encoder.T5DiffusionEncoder) -- both d_model and l_tgt are therefore derived
+        # from the T5 model itself, not free CLI choices; l_tgt_t5 also replaces
+        # meta["l_tgt"] as this run's diffusion-canvas length.
+        encoder = t5_encoder.load_t5_diffusion_encoder(args.t5_model_name, device)
         d_model = encoder.d_model
-        print(f"loaded frozen T5 encoder '{args.t5_model_name}' "
-              f"(t5 hidden={encoder.t5.config.d_model} -> projected d_model={d_model})")
+        l_tgt = encoder.l_tgt_t5
+        print(f"loaded frozen T5 diffusion encoder '{args.t5_model_name}' -- diffusing "
+              f"directly in T5's own embedding space: d_model={d_model}, l_tgt_t5={l_tgt} "
+              f"(vs. this project's own vocab_size={vocab_size}, l_tgt={meta['l_tgt']})")
 
     model = dlm_module.DLMDecoder(
         l_tgt=l_tgt, d_model=d_model, n_layers=args.n_layers, n_heads=args.n_heads,
@@ -146,12 +159,20 @@ def main():
                       "use_self_cond": args.selfcond_prob > 0}
 
     config = vars(args) | {"l_in": l_in, "l_tgt": l_tgt, "vocab_size": vocab_size, "d_model": d_model}
+    # eval_decoder is what metrics.run_eval actually calls .generate() on: in T5-diffusion
+    # mode this is the raw model wrapped so it still speaks the project's own vocab to
+    # every downstream consumer (metrics.py, viz.py) -- see T5SpaceDLMAdapter's docstring.
+    eval_decoder = (
+        t5_encoder.T5SpaceDLMAdapter(model, encoder.t5_tokenizer) if args.encoder_kind == "t5" else model
+    )
 
     start_step = 0
     resumed_wandb_run_id = None
     ckpt_path = common.resolve_checkpoint_path(args.run_dir, args.resume)
     if ckpt_path is not None:
-        common.check_checkpoint_config(ckpt_path, {"encoder_kind": args.encoder_kind, "optimizer": args.optimizer})
+        common.check_checkpoint_config(
+            ckpt_path, {"encoder_kind": args.encoder_kind, "optimizer": args.optimizer, "t5_model_name": args.t5_model_name}
+        )
         state = common.load_checkpoint(ckpt_path, model, optimizer, scheduler, map_location=device)
         start_step = state["step"] + 1
         if "early_stopper" in state["extra_state"]:
@@ -165,8 +186,8 @@ def main():
                              mode=args.wandb_mode, run_id=resumed_wandb_run_id)
 
     def do_eval(step: int, max_batches, prefix: str, log_images: bool):
-        id_res = metrics.run_eval(model, encoder, val_id_loader, device, sample_kwargs, max_batches=max_batches)
-        ood_res = metrics.run_eval(model, encoder, val_ood_loader, device, sample_kwargs, max_batches=max_batches)
+        id_res = metrics.run_eval(eval_decoder, encoder, val_id_loader, device, sample_kwargs, max_batches=max_batches)
+        ood_res = metrics.run_eval(eval_decoder, encoder, val_ood_loader, device, sample_kwargs, max_batches=max_batches)
         run.log({
             f"{prefix}/id/token_accuracy": id_res["token_accuracy"],
             f"{prefix}/id/token_accuracy_nopad": id_res["token_accuracy_nopad"],
@@ -200,7 +221,13 @@ def main():
         batch = next(data_iter)
         input_ids = batch["input_ids"].to(device)
         input_mask = batch["input_mask"].to(device)
-        target_ids = batch["target_ids"].to(device)
+        # In T5-diffusion mode, target_ids must be T5's own tokenization of the
+        # serialized path text (what the DLM actually diffuses into), not the project's
+        # own vocab -- see T5DiffusionEncoder.tokenize_path_targets.
+        if args.encoder_kind == "t5":
+            target_ids = encoder.tokenize_path_targets(batch["target_ids"], device)
+        else:
+            target_ids = batch["target_ids"].to(device)
 
         context, context_mask = common.encode_context(encoder, input_ids, input_mask)
 

@@ -34,14 +34,17 @@ from torch.utils.data import DataLoader
 
 from spelf import arlm as arlm_module, common, dataset as ds, dlm as dlm_module, metrics
 from spelf.encoder import load_frozen_encoder
-from spelf.t5_encoder import load_t5_encoder
+from spelf import t5_encoder
 
 
-def load_encoder_from_checkpoint(checkpoint: str, encoder_ckpt_override, device):
+def load_encoder_from_checkpoint(checkpoint: str, model_kind: str, encoder_ckpt_override, device):
     """Same encoder-reconstruction logic as eval_only.py: the conditioning encoder isn't
     saved inside the DLM/ARLM checkpoint itself (it's a separately frozen/pretrained
     module), so it's rebuilt from either an explicit --encoder_ckpt or the path the
-    checkpoint's own config recorded at training time."""
+    checkpoint's own config recorded at training time. `model_kind` matters when
+    encoder_kind=="t5": DLM+T5 diffuses directly in T5's own frozen embedding space
+    (t5_encoder.T5DiffusionEncoder), while ARLM+T5 only conditions on T5
+    (t5_encoder.T5GraphEncoder) -- see those classes' docstrings."""
     ckpt_state = torch.load(checkpoint, map_location=device, weights_only=False)
     cfg = ckpt_state["config"]
     encoder_kind = cfg.get("encoder_kind", "custom")
@@ -49,8 +52,12 @@ def load_encoder_from_checkpoint(checkpoint: str, encoder_ckpt_override, device)
         encoder_ckpt = encoder_ckpt_override or cfg.get("encoder_ckpt")
         assert encoder_ckpt, "encoder_ckpt not found in checkpoint config -- pass --encoder_ckpt explicitly"
         encoder = load_frozen_encoder(encoder_ckpt, device)
+    elif model_kind == "dlm":
+        encoder = t5_encoder.load_t5_diffusion_encoder(
+            cfg.get("t5_model_name", "t5-small"), device, l_tgt_t5=cfg.get("l_tgt")
+        )
     else:
-        encoder = load_t5_encoder(cfg.get("t5_model_name", "t5-small"), cfg.get("d_model", 128), device)
+        encoder = t5_encoder.load_t5_encoder(cfg.get("t5_model_name", "t5-small"), cfg.get("d_model", 128), device)
         encoder_trainable = ckpt_state["extra_state"].get("encoder_trainable")
         assert encoder_trainable, "checkpoint's config says encoder_kind=t5 but has no saved encoder_trainable state"
         encoder.load_trainable_state_dict(encoder_trainable)
@@ -156,20 +163,27 @@ def main():
     device = common.get_device()
     print(f"device={device}")
 
-    ckpt_state, cfg, encoder = load_encoder_from_checkpoint(args.checkpoint, args.encoder_ckpt, device)
+    ckpt_state, cfg, encoder = load_encoder_from_checkpoint(args.checkpoint, args.model_kind, args.encoder_ckpt, device)
     meta = ds.load_meta(args.data_dir)
-    model, sample_kwargs = build_decoder(args.model_kind, cfg, meta["l_tgt"], encoder, device,
+    l_tgt = cfg.get("l_tgt", meta["l_tgt"])  # DLM+T5 checkpoints save their own l_tgt_t5 here
+    model, sample_kwargs = build_decoder(args.model_kind, cfg, l_tgt, encoder, device,
                                           args.num_sample_steps, args.guidance_scale)
     model.load_state_dict(ckpt_state["model_state"])
     model.eval()
     print(f"loaded {args.model_kind} checkpoint from {args.checkpoint} (step {ckpt_state.get('step')})")
+
+    encoder_kind = cfg.get("encoder_kind", "custom")
+    eval_decoder = (
+        t5_encoder.T5SpaceDLMAdapter(model, encoder.t5_tokenizer)
+        if args.model_kind == "dlm" and encoder_kind == "t5" else model
+    )
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 7))
     for ax, split_name, filename in zip(axes, ["id", "ood"], ["val_id.pt", "val_ood.pt"]):
         val_ds = ds.PathDataset(Path(args.data_dir) / filename)
         loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                              num_workers=args.num_workers, collate_fn=ds.collate_fn)
-        res = metrics.run_eval(model, encoder, loader, device, sample_kwargs)
+        res = metrics.run_eval(eval_decoder, encoder, loader, device, sample_kwargs)
         counts = _counts_from_examples(res["examples"], res["n_examples"])
         print(f"[{split_name}] {counts}")
         _draw_venn(ax, counts, title=f"{split_name.upper()} split")

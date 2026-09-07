@@ -47,7 +47,7 @@ depends on a completed encoder checkpoint, because both `train_dlm.py` and
 | [`src/spelf/dataset.py`](src/spelf/dataset.py) | Thin `torch.utils.data.Dataset` wrappers around the cached tensors. |
 | [`src/spelf/modules.py`](src/spelf/modules.py) | Shared building blocks: `SharedEmbedding`, `LearnedPosEnc`, `TimeEmbedding`, `EncoderLayer`, `DecoderLayer`. |
 | [`src/spelf/encoder.py`](src/spelf/encoder.py) | `GraphEncoder` + its masked-language-model (MLM) pretraining objective. |
-| [`src/spelf/t5_encoder.py`](src/spelf/t5_encoder.py) | Optional alternative conditioning encoder: frozen pretrained HuggingFace T5 over a text serialization of the graph. |
+| [`src/spelf/t5_encoder.py`](src/spelf/t5_encoder.py) | Optional T5-based encoders: `T5GraphEncoder` (conditioning-only, ARLM) and `T5DiffusionEncoder` (diffuses directly in T5's own frozen embedding space, DLM — matches canonical ELF's actual use of T5) — see §6.5. |
 | [`src/spelf/dlm.py`](src/spelf/dlm.py) | `DLMDecoder` — ELF-style rectified-flow diffusion decoder (loss + Euler sampler). |
 | [`src/spelf/arlm.py`](src/spelf/arlm.py) | `GPTDecoder` — causal autoregressive decoder (loss + greedy sampler). |
 | [`src/spelf/muon.py`](src/spelf/muon.py) | `Muon` optimizer — the canonical ELF implementation's optimizer for the DLM's own hidden weight matrices (verified against arXiv:2605.10938 directly; see §6.8). |
@@ -340,16 +340,20 @@ Callers (`common.encode_context`) must still wrap the encoder's forward pass in
 *not* frozen, and this conditioning path should never contribute gradient to them (they
 should only train via the decoder's own target-embedding lookups).
 
-### 6.5 Optional T5 conditioning encoder (`T5GraphEncoder`)
+### 6.5 Optional T5 encoders (`t5_encoder.py`) — two different designs for two different decoders
 
-An alternative to `GraphEncoder`, selected via `--encoder_kind t5`. Closer to ELF's
-actual paper setup (a frozen pretrained *text* encoder) than this project's default
-from-scratch graph encoder, letting the comparison ask "is a strong pretrained text
-encoder a better or worse conditioning source than a small from-scratch graph encoder?"
-while holding the decoder fixed.
+`--encoder_kind t5` selects T5 over this project's own `GraphEncoder`, but the DLM and
+ARLM use it in two structurally different ways — because "use T5" means something
+different depending on whether the decoder is autoregressive or diffusion-based. This
+was a deliberate correction made partway through this project (see the conversation that
+introduced `T5DiffusionEncoder`): the original design used T5 purely as a conditioning
+source for *both* decoders, which is a reasonable, ordinary choice for the ARLM but does
+not reflect what the canonical ELF paper (arXiv:2605.10938) actually does with T5 for a
+diffusion decoder — verified directly against the paper before making this distinction.
 
+**`T5GraphEncoder`** (used by `GPTDecoder` + T5) — T5 as a pure *conditioning source*.
 Key differences from `GraphEncoder`, all consequences of T5 operating on natural-language
-subwords rather than this project's own 22-token graph vocab:
+subwords rather than this project's own 21-token graph vocab:
 - `T5GraphEncoder.forward` first serializes the decoded graph to an English sentence
   (`graph_to_text`) and retokenizes with T5's own tokenizer — so its output
   sequence length/mask are **unrelated** to `input_mask`, unlike `GraphEncoder` (whose
@@ -358,9 +362,10 @@ subwords rather than this project's own 22-token graph vocab:
   assuming `context_mask := input_mask`.
 - It owns its *own* fresh `SharedEmbedding` over the graph vocab (trained from scratch
   alongside the decoder) plus a trainable `nn.Linear` projection from T5's hidden size
-  down to `d_model` — only those two pieces train; the pretrained T5 stack itself stays
-  frozen (`T5GraphEncoder.freeze`) and its `.train()` is overridden so a stray recursive
-  `.train()` call from a parent module can never toggle its dropout back on.
+  down to a freely-chosen `d_model` — only those two pieces train; the pretrained T5
+  stack itself stays frozen (`T5GraphEncoder.freeze`) and its `.train()` is overridden so
+  a stray recursive `.train()` call from a parent module can never toggle its dropout
+  back on.
 - `context_requires_grad = True` (checked by `common.encode_context`) because gradient
   must still flow to `proj`/`embedding` even though the T5 forward pass itself runs
   under `torch.no_grad()` internally.
@@ -368,8 +373,71 @@ subwords rather than this project's own 22-token graph vocab:
   `embedding` — the frozen T5 stack is fully reproducible from `--t5_model_name` alone,
   so re-saving tens of millions of frozen params on every checkpoint would be pure waste.
 
-Requires `transformers`/`sentencepiece` (see [`requirements.txt`](requirements.txt)),
-otherwise unused.
+**`T5DiffusionEncoder`** (used by `DLMDecoder` + T5) — T5 as the DLM's actual diffusion
+space, matching what the canonical ELF paper does: the DLM diffuses directly in T5's own
+frozen token embedding table, not a separately-trained small one. Concretely:
+- `self.embedding = T5TiedEmbedding(self.t5.get_input_embeddings())` — a thin,
+  parameter-free adapter (`forward`/`unembed`/`.weight`) wrapping T5's own frozen
+  embedding table (a view, not a copy) so `DLMDecoder(..., embedding=encoder.embedding)`
+  works completely unchanged regardless of which embedding kind it received.
+- `self.d_model = self.t5.config.d_model` (512 for t5-small) — derived, not a free CLI
+  choice, since `x = T5_embedding(target_ids)` must live in that exact space.
+- **No `proj` layer.** T5's `last_hidden_state` and its embedding table share the same
+  dimension throughout T5's stack (standard T5 architecture: `d_model` is uniform across
+  embeddings and all hidden states, unlike the FFN's separate, larger `d_ff`), so once
+  the decoder's own `d_model` matches T5's, `last_hidden_state` can be used directly as
+  cross-attention context — verified via `T5EncoderModel.config.d_model` and the shape
+  of `last_hidden_state` before relying on it.
+- **Zero trainable parameters.** Everything (`self.t5` including its embedding table) is
+  frozen (`freeze()`); `trainable_state_dict()`/`load_trainable_state_dict()` are no-op
+  stubs kept only so `train_dlm.py`'s checkpoint code doesn't need a special case.
+  Consequently, this also eliminates the `<P>`/`<EOS>`-needs-separate-training problem
+  entirely for T5 mode (see §6.1) — T5's own pretraining corpus already contains
+  ordinary tokens like "Path", ":", "." with well-trained embeddings, unlike the
+  from-scratch `SharedEmbedding` case where those two markers start at random init.
+- **Target representation**: training targets are no longer
+  `tokenizer.encode_target(path)` — they're T5's own tokenization of
+  `path_to_text(path)` (e.g. `"Path : 3 - 7 - 4 - 5 ."`), produced by
+  `tokenize_path_targets`, padded/truncated to a fixed `l_tgt_t5`
+  (`compute_l_tgt_t5`) computed once from the *analytically worst-case* path — every
+  node's own graph uses at most `tok.MAX_NODES` distinct nodes (a path can't repeat a
+  node), and every node-id number contributes exactly one T5 token regardless of digit
+  count (verified against 2000+ random paths, none exceeding the constructed worst
+  case), so tokenizing `path_to_text(list(range(tok.MAX_NODES)))` gives a safe, tight
+  upper bound without needing to scan the dataset. `tokenize_path_targets` still asserts
+  (rather than silently truncating) if some path's tokenization ever exceeds this,
+  turning a violated assumption into a loud failure.
+- **Node-id token-boundary safety**: `graph_to_text`/`path_to_text` bound every
+  number with a literal space on both sides — including around `-`, `,`, and before
+  `.` — rather than writing it bare (the old `"3-7"` format). A space is a hard token
+  boundary for SentencePiece/BPE tokenizers, so this *guarantees* no node id can ever
+  share a token with a different node id, regardless of the tokenizer's specific BPE
+  merges. This isn't just asserted — it was verified directly against T5's real
+  tokenizer (the old unspaced format really does fuse some node-id pairs into a single
+  token, e.g. `"1-4"`; the spaced format never does), and `scripts/inspect_t5_tokenization.py`
+  re-verifies it automatically against real dataset examples every time it's run (see §9).
+- `DLMDecoder`'s own generations, in T5-vocab-id space, are unreadable to
+  `metrics.py`/`viz.py` as-is. `T5SpaceDLMAdapter` wraps the raw model so it exposes the
+  exact same `.generate(context, context_mask, **kwargs) -> LongTensor[B,
+  tokenizer.TARGET_LENGTH]` interface (in the *project's own vocab*) every other decoder
+  exposes: it detokenizes a generation via `decode_t5_path_ids`, and re-encodes a
+  successfully parsed path via `tokenizer.encode_target` — an unparseable generation (or
+  one whose path is too long for `TARGET_LENGTH`) is left as an all-`<PAD>` row, which
+  `tokenizer.decode_target` already treats as invalid (its first required token is
+  `<P>`). This is what lets `metrics.run_eval`/`viz.plot_example` stay completely
+  unaware T5 was ever involved — `train_dlm.py`/`eval_only.py`/`eval_venn.py` construct
+  this adapter locally and pass it wherever a decoder is handed to `metrics.run_eval`,
+  never to `dlm.loss` (training loss always operates on the raw model with real T5-space
+  target ids).
+- `decode_t5_path_text`/`decode_t5_path_ids` are the T5-space analogues of
+  `tokenizer.decode_target` — same division of responsibility (format parsing only, not
+  semantic path validity) and same strictness about trailing content after the stop
+  marker (`</s>`/`<pad>` here, `<EOS>`/`<PAD>` there).
+
+Both T5 classes require `transformers`/`sentencepiece` (see
+[`requirements.txt`](requirements.txt)), otherwise unused. `train_arlm.py` is completely
+unaffected by `T5DiffusionEncoder`'s introduction — it still builds `T5GraphEncoder`
+exactly as before.
 
 ### 6.6 DLMDecoder: ELF-style rectified-flow decoder
 
@@ -561,6 +629,7 @@ Source: [`common.py`](src/spelf/common.py).
 | [`eval_only.py`](scripts/eval_only.py) | a trained checkpoint (`--checkpoint`), the encoder it references (`--encoder_ckpt` or the value baked into the checkpoint's own config), `data/val_{id,ood}.pt` | optional PNGs (`--save_viz_dir`), optional wandb log | Reconstructs the encoder+decoder purely from the checkpoint's saved config — no training-script CLI args need to be re-supplied by hand. |
 | [`eval_venn.py`](scripts/eval_venn.py) | same as `eval_only.py` | one PNG (`--out`, defaults to `venn_{model_kind}_{checkpoint_stem}.png`) | Same checkpoint-driven reconstruction pattern as `eval_only.py` (`load_encoder_from_checkpoint`/`build_decoder` duplicate that logic locally rather than importing it, since `eval_only.py` doesn't expose it as a reusable function). See §9.6 for the diagram's design. |
 | [`dataset_stats.py`](scripts/dataset_stats.py) | `data/{train,val_id,val_ood,encoder_pretrain_extra}.pt`, `data/meta.json` | one text report (`--out`, defaults to `{data_dir}/dataset_stats.txt`) | No model/checkpoint involved at all — pure dataset introspection. See §9.7. |
+| [`inspect_t5_tokenization.py`](scripts/inspect_t5_tokenization.py) | `data/{train,val_id,val_ood}.pt` (one split, `--split`), no checkpoint | one text report (`--out`, defaults to `{data_dir}/t5_tokenization_samples.txt`) | Also runs (and exits non-zero on failure) the automated node-id-token-boundary check described in §6.5/§9.8. |
 
 ### 9.1–9.5 Training-script control flow (shared shape across `pretrain_encoder.py`/`train_dlm.py`/`train_arlm.py`)
 
@@ -621,6 +690,20 @@ token-count stats), so it's *expected* to differ slightly from the graph-weighte
 development (0 mismatches between per-example implied diameter and the example's own
 graph's true `nx.diameter` across 2000 sampled examples).
 
+### 9.8 `inspect_t5_tokenization.py`'s automated boundary check
+
+For each sampled example's `graph_to_text`/`path_to_text` output, the script tokenizes
+with `return_offsets_mapping=True` (T5's fast tokenizer gives each token's character
+span in the source string) and separately regexes the source string for every node-id
+number's own character span (`\d+`). A check fails if any single token's span overlaps
+*two different* number spans — i.e. tokenization fused two distinct node ids into one
+token, exactly the failure mode `graph_to_text`/`path_to_text`'s spacing (§6.5) is
+designed to prevent. This is a genuine per-sample verification against the real
+tokenizer, not a static assumption — `tests/test_t5_encoder.py` includes a regression
+check confirming the *old* unspaced edge format (`"3-7"`, no surrounding spaces) really
+does fail this exact check for some inputs, so the check itself is known to be
+meaningful and not vacuously always-passing.
+
 ## 10. Tunable variables (CLI arguments)
 
 Every `argparse` flag in the codebase, grouped by concern. Script column shows which
@@ -640,11 +723,11 @@ name, its default may differ between them (noted inline).
 | `--n_encoder_pretrain_ood_graphs` | 10000 | Graphs in `encoder_pretrain_extra.pt` (§5.6). |
 | `--avg_degree` | 3.0 | Target average node degree, drives the Erdős–Rényi edge probability (`graphgen._sample_graph_contiguous`). |
 
-### Architecture (shared shape across `pretrain_encoder.py`/`train_dlm.py`/`train_arlm.py`; T5 mode overrides `d_model`)
+### Architecture (shared shape across `pretrain_encoder.py`/`train_dlm.py`/`train_arlm.py`)
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--d_model` | 128 | Hidden size. In `train_dlm.py`/`train_arlm.py`, only used when `--encoder_kind t5` — custom mode infers `d_model` from the loaded `--encoder_ckpt` instead. |
+| `--d_model` | 128 | Hidden size. `train_arlm.py`: only used when `--encoder_kind t5` (custom mode infers it from `--encoder_ckpt`). **Not present in `train_dlm.py`** — `d_model` there is always derived (from `--encoder_ckpt` in custom mode, from the T5 model's own `config.d_model` in t5 mode, §6.5), never a free choice, so there's nothing for a flag to override. |
 | `--n_layers` | 2 | Transformer layers (encoder or decoder, per script). |
 | `--n_heads` | 8 | Attention heads. |
 | `--d_mlp` | 512 | MLP hidden size. |
@@ -654,7 +737,7 @@ name, its default may differ between them (noted inline).
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--encoder_kind` | `custom` | `custom` = this project's `GraphEncoder` (`--encoder_ckpt` required); `t5` = frozen pretrained `T5GraphEncoder` (§6.5). |
+| `--encoder_kind` | `custom` | `custom` = this project's `GraphEncoder` (`--encoder_ckpt` required). `t5` = frozen pretrained T5 — `T5GraphEncoder` (conditioning-only) for `train_arlm.py`, `T5DiffusionEncoder` (diffuses in T5's own embedding space) for `train_dlm.py` (§6.5). |
 | `--encoder_ckpt` | `None` | Path to a `pretrain_encoder.py` checkpoint; required iff `--encoder_kind custom`. |
 | `--t5_model_name` | `t5-small` | HuggingFace T5 checkpoint name; used iff `--encoder_kind t5`. |
 
@@ -747,6 +830,17 @@ name, its default may differ between them (noted inline).
 | `--data_dir` | `data` | Dataset directory to analyze. |
 | `--out` | `{data_dir}/dataset_stats.txt` | Report output path. |
 
+### T5 tokenization inspection (`inspect_t5_tokenization.py`)
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--data_dir` | `data` | Dataset directory to read the chosen split from. |
+| `--split` | `val_id` | `train` \| `val_id` \| `val_ood`. |
+| `--t5_model_name` | `t5-small` | Which T5 tokenizer to inspect against. |
+| `--n_samples` | 20 | Examples sampled (without replacement) for the report. |
+| `--seed` | 0 | Sampling seed. |
+| `--out` | `{data_dir}/t5_tokenization_samples.txt` | Report output path. |
+
 ## 11. Non-tunable variables (hardcoded constants)
 
 These are not exposed as CLI flags; changing them means editing source, and several have
@@ -772,6 +866,8 @@ correctness implications elsewhere in the codebase if changed carelessly.
 | `viz.py` node sizes/colors | `node_size=300/400`; blue=path, green=start, orange=end, red=invalid | `viz.py` | Cosmetic, not configurable via CLI. |
 | `keep_last_k` (checkpoint snapshot pruning) | 3 | `common.save_checkpoint` default arg | Not exposed via any script's CLI; every call site uses the default. |
 | optimizer no-decay rule | param `ndim<=1` or name contains `"embedding"`/`"norm"`/`"null_context"` | `common.build_optimizer` | Fixed heuristic, not parameterized. |
+| `l_tgt_t5` safety margin | `margin=8` | `t5_encoder.compute_l_tgt_t5` default arg | Headroom beyond the analytically-derived worst-case T5-token length (§6.5); not exposed via any script's CLI. |
+| `T5DiffusionEncoder`/`T5GraphEncoder` `max_text_len` | 256 | `t5_encoder.py` constructor default | Truncation cap for T5-tokenized graph-description text; not exposed via CLI — large relative to any real serialized graph in this dataset (§5's largest `l_in` is 124 project-vocab tokens). |
 
 ## 12. Checkpoint schema
 
@@ -837,5 +933,19 @@ project's original plan):
   double-assignment and no missing parameter; `MultiOptimizer`/`MultiScheduler`
   state-dict round-tripping and shared warmup/cosine shape across both underlying
   optimizers.
+- `test_t5_encoder.py` — the T5-diffusion machinery (§6.5), run against the real T5
+  tokenizer/embedding table (not mocked): `graph_to_text`/`path_to_text` never let a
+  node-id number share a token with a different one (checked via the tokenizer's own
+  offset mapping), including a regression check confirming the *old* unspaced format
+  really does fail this for some inputs (so the check is known to be meaningful, not
+  vacuous); `decode_t5_path_text`/`decode_t5_path_ids` round-trip real tokenizations and
+  reject malformed input the same way `tokenizer.decode_target` does;
+  `compute_l_tgt_t5`'s worst-case bound holds against 50 random paths;
+  `T5TiedEmbedding` is a parameter-free view onto T5's own embedding table;
+  `T5DiffusionEncoder` has zero trainable parameters; `T5SpaceDLMAdapter` round-trips a
+  well-formed generation back to the correct path and never crashes on garbage input.
 
 Run with `pytest tests/ -q` from the repo root (after `pip install -r requirements.txt`).
+`test_t5_encoder.py` downloads/loads a real `t5-small` tokenizer and encoder model on
+first use (via `transformers`) — the only test file in this suite that does real network
+I/O (or reads from the local HuggingFace cache) rather than running purely offline.

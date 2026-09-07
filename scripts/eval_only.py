@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 
 from spelf import arlm as arlm_module, common, dataset as ds, dlm as dlm_module, metrics, viz
 from spelf.encoder import load_frozen_encoder
-from spelf.t5_encoder import load_t5_encoder
+from spelf import t5_encoder
 
 
 def main():
@@ -50,14 +50,22 @@ def main():
         encoder_ckpt = args.encoder_ckpt or cfg.get("encoder_ckpt")
         assert encoder_ckpt, "encoder_ckpt not found in checkpoint config -- pass --encoder_ckpt explicitly"
         encoder = load_frozen_encoder(encoder_ckpt, device)
+    elif args.model_kind == "dlm":
+        # DLM+T5 diffuses directly in T5's own frozen embedding space (see
+        # t5_encoder.T5DiffusionEncoder) -- l_tgt_t5 is read back from the checkpoint's
+        # own config rather than recomputed, matching how every other architecture
+        # field here is reconstructed purely from the checkpoint.
+        encoder = t5_encoder.load_t5_diffusion_encoder(
+            cfg.get("t5_model_name", "t5-small"), device, l_tgt_t5=cfg.get("l_tgt")
+        )
     else:
-        encoder = load_t5_encoder(cfg.get("t5_model_name", "t5-small"), cfg.get("d_model", 128), device)
+        encoder = t5_encoder.load_t5_encoder(cfg.get("t5_model_name", "t5-small"), cfg.get("d_model", 128), device)
         encoder_trainable = ckpt_state["extra_state"].get("encoder_trainable")
         assert encoder_trainable, "checkpoint's config says encoder_kind=t5 but has no saved encoder_trainable state"
         encoder.load_trainable_state_dict(encoder_trainable)
 
     meta = ds.load_meta(args.data_dir)
-    l_tgt = meta["l_tgt"]
+    l_tgt = cfg.get("l_tgt", meta["l_tgt"])  # DLM+T5 checkpoints save their own l_tgt_t5 here
 
     if args.model_kind == "dlm":
         model = dlm_module.DLMDecoder(
@@ -79,6 +87,15 @@ def main():
     model.eval()
     print(f"loaded {args.model_kind} checkpoint from {args.checkpoint} (step {ckpt_state.get('step')})")
 
+    # eval_decoder is what actually gets handed to metrics.run_eval -- for DLM+T5 this
+    # is the raw model wrapped so its T5-vocab generations still speak the project's own
+    # vocab to metrics.py/viz.py (see T5SpaceDLMAdapter's docstring); every other
+    # combination evaluates the raw model directly, unchanged.
+    eval_decoder = (
+        t5_encoder.T5SpaceDLMAdapter(model, encoder.t5_tokenizer)
+        if args.model_kind == "dlm" and encoder_kind == "t5" else model
+    )
+
     splits = {"id": "val_id.pt", "ood": "val_ood.pt"} if args.split == "both" else {args.split: f"val_{args.split}.pt"}
 
     run_name = args.wandb_run_name or f"eval-{args.model_kind}-{Path(args.checkpoint).stem}"
@@ -91,7 +108,7 @@ def main():
         val_ds = ds.PathDataset(Path(args.data_dir) / filename)
         loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                              num_workers=args.num_workers, collate_fn=ds.collate_fn)
-        res = metrics.run_eval(model, encoder, loader, device, sample_kwargs)
+        res = metrics.run_eval(eval_decoder, encoder, loader, device, sample_kwargs)
         print(f"[{split_name}] n={res['n_examples']} token_acc={res['token_accuracy']:.4f} "
               f"token_acc_nopad={res['token_accuracy_nopad']:.4f} "
               f"exact_match={res['exact_match_rate']:.4f} valid={res['valid_rate']:.4f} "

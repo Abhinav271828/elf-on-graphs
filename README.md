@@ -41,6 +41,9 @@ shortest-path/
     dlm.py                      ELF-style diffusion decoder (train loss + sampler)
     arlm.py                     GPT-style causal decoder (train loss + sampler)
     muon.py                     Muon optimizer (canonical ELF's DLM optimizer)
+    t5_encoder.py                T5GraphEncoder (conditioning-only, ARLM) +
+                                 T5DiffusionEncoder (diffuses in T5's own embedding
+                                 space, DLM) -- see "T5 as an alternative encoder" above
     metrics.py                  decode generations -> exact-match/valid/optimal rates
     viz.py                      ground-truth-vs-generated graph plots for wandb
     common.py                   seeding, optimizer/LR schedule, checkpoint save/resume,
@@ -55,6 +58,9 @@ shortest-path/
                                  correct-length/optimal Venn diagram, ID + OOD
     dataset_stats.py            report per-split token-count and graph-connectivity
                                  statistics for a generated dataset
+    inspect_t5_tokenization.py  show (and verify) how T5's real tokenizer segments a
+                                 batch of real graph/path examples, token boundaries
+                                 marked with '|'
   tests/                       unit tests for tokenizer + graph generator
   data/                        generated datasets (gitignored)
   runs/                        checkpoints + configs per run (gitignored)
@@ -183,6 +189,49 @@ to the same frozen encoder context via the identical `DecoderLayer` class the DL
 with ordinary teacher-forced next-token cross-entropy (`<PAD>` excluded from the loss,
 since the ARLM naturally stops at `<EOS>`); sampled greedily, autoregressively, no
 KV-cache (negligible cost at this scale).
+
+## T5 as an alternative encoder (`--encoder_kind t5`)
+
+Both `train_dlm.py`/`train_arlm.py` accept `--encoder_kind t5` in place of the default
+`custom` (this project's own from-scratch `GraphEncoder`). Both serialize the graph to
+English text via `t5_encoder.graph_to_text` and encode it with a frozen pretrained
+HuggingFace T5 (`--t5_model_name`, default `t5-small`) — but the *DLM* and the *ARLM* use
+T5 in two structurally different ways (`t5_encoder.py`):
+
+- **`GPTDecoder` + T5** (`T5GraphEncoder`): T5 is purely a *conditioning source*. A
+  trainable `nn.Linear` projects T5's frozen hidden states down to a freely-chosen
+  `d_model` (128 by default); the decoder still generates in this project's own small
+  21-token vocab, embedded by a separate, freshly-trained `SharedEmbedding`. An entirely
+  ordinary design for an autoregressive model.
+- **`DLMDecoder` + T5** (`T5DiffusionEncoder`): matches what the canonical ELF
+  implementation (arXiv:2605.10938) actually does with T5 — the DLM diffuses *directly in
+  T5's own frozen token embedding space*, not a separately-trained one. Concretely: the
+  target for training is T5's own tokenization of `t5_encoder.path_to_text(path)` (e.g.
+  `"Path : 3 - 7 - 4 - 5 ."`), padded to a fixed `l_tgt_t5` computed once from the
+  worst-case 14-node path; the diffusion embedding/unembedding is tied to T5's own
+  (frozen) ~32k-token embedding table (`T5TiedEmbedding`); and there is no projection
+  layer at all — T5's contextualized hidden states and its embedding table share the same
+  dimension throughout its stack, so once the decoder's own `d_model` is set to T5's
+  (512 for t5-small), T5's `last_hidden_state` is used directly as cross-attention
+  context. This also means `T5DiffusionEncoder` has *zero* trainable parameters of its
+  own — every trainable weight lives in `DLMDecoder`.
+
+  `metrics.py`/`viz.py` stay completely unaware any of this happened: `eval_only.py` /
+  `eval_venn.py` / `train_dlm.py`'s own eval calls wrap the raw model in
+  `t5_encoder.T5SpaceDLMAdapter`, which detokenizes a T5-space generation back to a path
+  and re-encodes it in the project's own vocab (`tokenizer.encode_target`) before handing
+  it to `metrics.run_eval` — an unparseable generation just re-encodes to an all-`<PAD>`
+  row, which `tokenizer.decode_target` already treats as invalid.
+
+**Node-id token-boundary safety**: every number in `graph_to_text`/`path_to_text` is
+bounded by a literal space on both sides (including around `-`, `,`, and before `.`) —
+not written bare (`"3-7"`) — because a space is a hard token boundary for
+SentencePiece/BPE tokenizers, so no node id can ever end up sharing a single token with a
+different node id. This was verified directly against T5's real tokenizer, not just
+assumed: the old unspaced format really does fuse some adjacent node ids into one token
+(e.g. `"1-4"` → a single token); the spaced format never does, across every case checked.
+Run `scripts/inspect_t5_tokenization.py` to see this for real, per-token, against a batch
+of actual dataset examples (see below).
 
 ## Evaluation
 
@@ -343,6 +392,21 @@ paths, hence more examples, count more), so it's expected to differ slightly fro
 --out ...                  # optional; defaults to {data_dir}/dataset_stats.txt
 ```
 
+### `scripts/inspect_t5_tokenization.py`
+Shows exactly how T5's real tokenizer segments a batch of real `graph_to_text`/
+`path_to_text` examples -- token boundaries marked with `|` -- and automatically checks
+(via the tokenizer's own char-offset mapping) that no single token ever spans two
+different node-id numbers, exiting non-zero if that check ever fails. See "T5 as an
+alternative encoder" above for why this matters.
+```
+--data_dir data
+--split val_id             # 'train' | 'val_id' | 'val_ood'
+--t5_model_name t5-small
+--n_samples 20
+--seed 0
+--out ...                  # optional; defaults to {data_dir}/t5_tokenization_samples.txt
+```
+
 ## Running it
 
 ```bash
@@ -350,9 +414,14 @@ pip install -r requirements.txt
 
 python scripts/generate_data.py --seed 42 --out_dir data/
 python scripts/dataset_stats.py --data_dir data/ --out data/dataset_stats.txt
+python scripts/inspect_t5_tokenization.py --data_dir data/ --n_samples 20
 python scripts/pretrain_encoder.py --data_dir data/ --run_dir runs/encoder/
 python scripts/train_dlm.py  --data_dir data/ --encoder_ckpt runs/encoder/checkpoint_best.pt --run_dir runs/dlm/  --wandb_run_name dlm-run1
 python scripts/train_arlm.py --data_dir data/ --encoder_ckpt runs/encoder/checkpoint_best.pt --run_dir runs/arlm/ --wandb_run_name arlm-run1
+
+# T5 as the encoder instead (see "T5 as an alternative encoder" above) -- no --encoder_ckpt needed:
+python scripts/train_dlm.py  --data_dir data/ --encoder_kind t5 --run_dir runs/dlm_t5/  --wandb_run_name dlm-t5-run1
+python scripts/train_arlm.py --data_dir data/ --encoder_kind t5 --run_dir runs/arlm_t5/ --wandb_run_name arlm-t5-run1
 
 # later, standalone:
 python scripts/eval_only.py --checkpoint runs/dlm/checkpoint_best.pt  --model_kind dlm  --data_dir data/ --split both
