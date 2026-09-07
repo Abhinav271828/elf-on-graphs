@@ -41,9 +41,10 @@ shortest-path/
     dlm.py                      ELF-style diffusion decoder (train loss + sampler)
     arlm.py                     GPT-style causal decoder (train loss + sampler)
     muon.py                     Muon optimizer (canonical ELF's DLM optimizer)
-    t5_encoder.py                T5GraphEncoder (conditioning-only, ARLM) +
-                                 T5DiffusionEncoder (diffuses in T5's own embedding
-                                 space, DLM) -- see "T5 as an alternative encoder" above
+    t5_encoder.py                T5GraphEncoder (ARLM: T5 conditions + ARLM decodes into
+                                 T5's own vocab) + T5DiffusionEncoder (DLM diffuses in
+                                 T5's own embedding space) -- see "T5 as an alternative
+                                 encoder" above
     metrics.py                  decode generations -> exact-match/valid/optimal rates
     viz.py                      ground-truth-vs-generated graph plots for wandb
     common.py                   seeding, optimizer/LR schedule, checkpoint save/resume,
@@ -172,8 +173,15 @@ decay would otherwise shrink "frozen" rows regardless of their zeroed gradient.)
 - The network does **x-prediction**: given noisy `z_t` and time `t`, predict the clean
   embedding `x̂`, trained with a reweighted MSE `(1/(1-t)²)·‖x̂-x‖²` (denoise branch, ~80%
   of each batch) or, on the other ~20% ("decode branch", near-clean `t∈[0.5,1]`),
-  cross-entropy after unembedding `x̂` back to token logits — so the same network serves
-  as both the flow-matching denoiser and the final embedding→token decoder.
+  cross-entropy after unembedding `x̂` back to token logits — same network serves as both
+  the flow-matching denoiser and the final embedding→token decoder. **Both losses
+  exclude `<PAD>` positions** (mean taken per example over its own real content
+  positions only), matching the canonical ELF implementation's own reference code
+  (confirmed directly against its source, not just the paper — the paper's loss
+  equations don't show masking either way). A generation is read by finding the first
+  `<EOS>` and ignoring everything after it (`tokenizer.decode_target`), not by
+  validating that the tail is literal `<PAD>` — nothing needs to be, since neither loss
+  trains the model on what belongs there.
 - **Self-conditioning**: half the time, an extra no-grad forward pass' prediction is fed
   back in as auxiliary input to the real forward pass (standard diffusion trick).
 - **CFG dropout**: 10% of examples have their conditioning context replaced with a
@@ -198,11 +206,22 @@ English text via `t5_encoder.graph_to_text` and encode it with a frozen pretrain
 HuggingFace T5 (`--t5_model_name`, default `t5-small`) — but the *DLM* and the *ARLM* use
 T5 in two structurally different ways (`t5_encoder.py`):
 
-- **`GPTDecoder` + T5** (`T5GraphEncoder`): T5 is purely a *conditioning source*. A
-  trainable `nn.Linear` projects T5's frozen hidden states down to a freely-chosen
-  `d_model` (128 by default); the decoder still generates in this project's own small
-  21-token vocab, embedded by a separate, freshly-trained `SharedEmbedding`. An entirely
-  ordinary design for an autoregressive model.
+- **`GPTDecoder` + T5** (`T5GraphEncoder`): T5 is a *conditioning source* — its own
+  contextualized hidden states are used directly as cross-attention context, with no
+  projection layer, so `d_model` is always T5's own hidden size (512 for t5-small),
+  tying the two systems' dimension exactly like `T5DiffusionEncoder` does below — **and**
+  the decoder generates directly *into T5's own ~32k-token vocabulary* instead of this
+  project's own 21-token one: training targets are T5's own tokenization of
+  `t5_encoder.path_to_text(path)`, with T5's own `pad_token_id` prepended as a
+  decoder-start marker (T5 has no dedicated BOS token; this mirrors the standard
+  `decoder_start_token_id = pad_token_id` T5/seq2seq convention). Its own
+  input-embedding and output-unembedding (`UntiedEmbedding`, sized to
+  `len(t5_tokenizer)`) are still two ordinary, independently-trained matrices — no
+  weight tying to each other, and none to T5's own (frozen) embedding table either, even
+  though they now share T5's vocabulary. Tying embed=unembed was never load-bearing here
+  the way it is for `GraphEncoder`/`T5DiffusionEncoder` (there, the tied table *is* the
+  pretrained conditioning signal being reused; here, there's nothing pretrained to tie
+  into, regardless of which vocabulary the decoder targets).
 - **`DLMDecoder` + T5** (`T5DiffusionEncoder`): matches what the canonical ELF
   implementation (arXiv:2605.10938) actually does with T5 — the DLM diffuses *directly in
   T5's own frozen token embedding space*, not a separately-trained one. Concretely: the
@@ -216,12 +235,14 @@ T5 in two structurally different ways (`t5_encoder.py`):
   context. This also means `T5DiffusionEncoder` has *zero* trainable parameters of its
   own — every trainable weight lives in `DLMDecoder`.
 
-  `metrics.py`/`viz.py` stay completely unaware any of this happened: `eval_only.py` /
-  `eval_venn.py` / `train_dlm.py`'s own eval calls wrap the raw model in
-  `t5_encoder.T5SpaceDLMAdapter`, which detokenizes a T5-space generation back to a path
-  and re-encodes it in the project's own vocab (`tokenizer.encode_target`) before handing
-  it to `metrics.run_eval` — an unparseable generation just re-encodes to an all-`<PAD>`
-  row, which `tokenizer.decode_target` already treats as invalid.
+`metrics.py`/`viz.py` stay completely unaware any of this happened, for either decoder:
+`eval_only.py` / `eval_venn.py` / `train_dlm.py`/`train_arlm.py`'s own eval calls wrap
+the raw model in `t5_encoder.T5SpaceDecoderAdapter`, which detokenizes a T5-space
+generation back to a path and re-encodes it in the project's own vocab
+(`tokenizer.encode_target`) before handing it to `metrics.run_eval` — an unparseable
+generation just re-encodes to an all-`<PAD>` row, which `tokenizer.decode_target`
+already treats as invalid. (The ARLM's own raw generation carries an extra leading
+decoder-start marker the DLM's doesn't, stripped via `drop_first_token=True`.)
 
 **Node-id token-boundary safety**: every number in `graph_to_text`/`path_to_text` is
 bounded by a literal space on both sides (including around `-`, `,`, and before `.`) —

@@ -133,10 +133,19 @@ def encode_target(path: Sequence[int], length: int = TARGET_LENGTH) -> list[int]
 
 def decode_target(ids: Sequence[int]) -> Optional[list[int]]:
     """Parse a (possibly model-generated) target sequence back to a node-id path.
-    Must be <P>, zero-or-more node tokens, <EOS>, then only <PAD>. Any other shape
-    (missing/duplicated <P>/<EOS>, non-node tokens in the path, junk after <EOS>)
-    yields None. This is the single source of truth for both ground truth and raw
-    model output."""
+    Must be <P>, zero-or-more node tokens, then <EOS> -- content after <EOS> is
+    ignored, not validated. Missing/duplicated <P>/<EOS>, or non-node tokens in the
+    path, still yield None. This is the single source of truth for both ground truth
+    and raw model output.
+
+    Trailing content is deliberately unchecked (not required to be <PAD>): dlm.loss
+    excludes pad_id positions from both its denoising and decode losses (matching the
+    canonical ELF implementation's own masking, verified directly against its source),
+    so nothing trains the DLM on what belongs after <EOS> -- a generation is meant to
+    be read by finding the first <EOS>, not by validating its tail. Requiring literal
+    <PAD> there would make every DLM generation with an untrained (and therefore
+    effectively arbitrary) tail spuriously invalid, regardless of whether its real
+    content was correct."""
     ids = list(ids)
     if not ids or ids[0] != P:
         return None
@@ -146,8 +155,5 @@ def decode_target(ids: Sequence[int]) -> Optional[list[int]]:
         path.append(tok_to_node(ids[i]))
         i += 1
     if i >= len(ids) or ids[i] != EOS:
-        return None
-    i += 1
-    if any(t != PAD for t in ids[i:]):
         return None
     return path

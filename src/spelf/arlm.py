@@ -37,44 +37,56 @@ class GPTDecoder(nn.Module):
 
     @torch.no_grad()
     def generate(self, context: torch.Tensor, context_mask: torch.Tensor,
-                 max_len: int | None = None) -> torch.Tensor:
-        return sample(self, context, context_mask, max_len=max_len)
+                 max_len: int | None = None, start_id: int = tok.P,
+                 eos_id: int = tok.EOS, pad_id: int = tok.PAD) -> torch.Tensor:
+        return sample(self, context, context_mask, max_len=max_len,
+                      start_id=start_id, eos_id=eos_id, pad_id=pad_id)
 
 
 def loss(model: GPTDecoder, context: torch.Tensor, context_mask: torch.Tensor,
-          target_ids: torch.Tensor) -> dict:
-    """Standard teacher-forced next-token cross-entropy; <PAD> excluded from the loss
-    (unlike the DLM -- the ARLM naturally stops generating via <EOS>, so it never needs
-    to learn to predict trailing <PAD>)."""
+          target_ids: torch.Tensor, pad_id: int = tok.PAD) -> dict:
+    """Standard teacher-forced next-token cross-entropy; `pad_id` positions excluded
+    from the loss (unlike the DLM -- the ARLM naturally stops generating via its own
+    stop token, so it never needs to learn to predict trailing padding). `pad_id`
+    defaults to this project's own <PAD> (0); pass T5's own `pad_token_id` when
+    decoding into T5's vocabulary instead (see t5_encoder.T5GraphEncoder)."""
     inp = target_ids[:, :-1]
     labels = target_ids[:, 1:]
     logits = model(inp, context, context_mask)
-    ce = F.cross_entropy(logits.transpose(1, 2), labels, ignore_index=tok.PAD)
+    ce = F.cross_entropy(logits.transpose(1, 2), labels, ignore_index=pad_id)
     with torch.no_grad():
         preds = logits.argmax(dim=-1)
-        real = labels != tok.PAD
+        real = labels != pad_id
         acc = ((preds == labels) & real).sum().float() / real.sum().clamp(min=1).float()
     return {"loss": ce, "token_accuracy": acc.item()}
 
 
 @torch.no_grad()
 def sample(model: GPTDecoder, context: torch.Tensor, context_mask: torch.Tensor,
-           max_len: int | None = None) -> torch.Tensor:
-    """Greedy autoregressive decoding starting from <P>, stopping at the first <EOS>
-    per example (or at max_len). No KV-cache -- recomputes the full forward pass each
-    step; negligible cost at this scale (2 layers, hidden 128, L_tgt<=16)."""
+           max_len: int | None = None, start_id: int = tok.P,
+           eos_id: int = tok.EOS, pad_id: int = tok.PAD) -> torch.Tensor:
+    """Greedy autoregressive decoding starting from `start_id`, stopping at the first
+    `eos_id` per example (or at max_len), padding with `pad_id` elsewhere. No KV-cache
+    -- recomputes the full forward pass each step; negligible cost at this scale
+    (2 layers, hidden 128-512, L_tgt<=~55).
+
+    Defaults (`tok.P`/`tok.EOS`/`tok.PAD`) match this project's own small vocab; when
+    decoding into T5's vocabulary (t5_encoder.T5GraphEncoder), pass T5's own
+    `pad_token_id` for both `start_id` and `pad_id` (the standard T5/seq2seq
+    convention -- T5 has no dedicated BOS token, so its own decoder_start_token_id is
+    conventionally pad_token_id too) and `eos_token_id` for `eos_id`."""
     B = context.shape[0]
     device = context.device
     L = max_len or model.l_tgt
-    generated = torch.full((B, L), tok.PAD, dtype=torch.long, device=device)
-    generated[:, 0] = tok.P
+    generated = torch.full((B, L), pad_id, dtype=torch.long, device=device)
+    generated[:, 0] = start_id
     finished = torch.zeros(B, dtype=torch.bool, device=device)
     for pos in range(1, L):
         logits = model(generated[:, :pos], context, context_mask)
         next_tok = logits[:, -1, :].argmax(dim=-1)
-        next_tok = torch.where(finished, torch.full_like(next_tok, tok.PAD), next_tok)
+        next_tok = torch.where(finished, torch.full_like(next_tok, pad_id), next_tok)
         generated[:, pos] = next_tok
-        finished = finished | (next_tok == tok.EOS)
+        finished = finished | (next_tok == eos_id)
         if bool(finished.all()):
             break
     return generated

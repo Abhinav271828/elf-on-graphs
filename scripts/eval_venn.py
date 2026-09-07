@@ -57,7 +57,7 @@ def load_encoder_from_checkpoint(checkpoint: str, model_kind: str, encoder_ckpt_
             cfg.get("t5_model_name", "t5-small"), device, l_tgt_t5=cfg.get("l_tgt")
         )
     else:
-        encoder = t5_encoder.load_t5_encoder(cfg.get("t5_model_name", "t5-small"), cfg.get("d_model", 128), device)
+        encoder = t5_encoder.load_t5_encoder(cfg.get("t5_model_name", "t5-small"), device)
         encoder_trainable = ckpt_state["extra_state"].get("encoder_trainable")
         assert encoder_trainable, "checkpoint's config says encoder_kind=t5 but has no saved encoder_trainable state"
         encoder.load_trainable_state_dict(encoder_trainable)
@@ -80,7 +80,11 @@ def build_decoder(model_kind, cfg, l_tgt, encoder, device, num_sample_steps, gui
             l_tgt=l_tgt, d_model=encoder.d_model, n_layers=cfg.get("n_layers", 2), n_heads=cfg.get("n_heads", 8),
             d_mlp=cfg.get("d_mlp", 512), dropout=cfg.get("dropout", 0.1), embedding=encoder.embedding,
         ).to(device)
-        sample_kwargs = {}
+        sample_kwargs = (
+            {"start_id": encoder.t5_tokenizer.pad_token_id, "eos_id": encoder.t5_tokenizer.eos_token_id,
+             "pad_id": encoder.t5_tokenizer.pad_token_id}
+            if cfg.get("encoder_kind", "custom") == "t5" else {}
+        )
     return model, sample_kwargs
 
 
@@ -165,7 +169,7 @@ def main():
 
     ckpt_state, cfg, encoder = load_encoder_from_checkpoint(args.checkpoint, args.model_kind, args.encoder_ckpt, device)
     meta = ds.load_meta(args.data_dir)
-    l_tgt = cfg.get("l_tgt", meta["l_tgt"])  # DLM+T5 checkpoints save their own l_tgt_t5 here
+    l_tgt = cfg.get("l_tgt", meta["l_tgt"])  # T5-vocab checkpoints (DLM+T5, ARLM+T5) save their own l_tgt_t5 here
     model, sample_kwargs = build_decoder(args.model_kind, cfg, l_tgt, encoder, device,
                                           args.num_sample_steps, args.guidance_scale)
     model.load_state_dict(ckpt_state["model_state"])
@@ -174,8 +178,8 @@ def main():
 
     encoder_kind = cfg.get("encoder_kind", "custom")
     eval_decoder = (
-        t5_encoder.T5SpaceDLMAdapter(model, encoder.t5_tokenizer)
-        if args.model_kind == "dlm" and encoder_kind == "t5" else model
+        t5_encoder.T5SpaceDecoderAdapter(model, encoder.t5_tokenizer, drop_first_token=(args.model_kind == "arlm"))
+        if encoder_kind == "t5" else model
     )
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 7))

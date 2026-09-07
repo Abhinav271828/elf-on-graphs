@@ -59,13 +59,13 @@ def main():
             cfg.get("t5_model_name", "t5-small"), device, l_tgt_t5=cfg.get("l_tgt")
         )
     else:
-        encoder = t5_encoder.load_t5_encoder(cfg.get("t5_model_name", "t5-small"), cfg.get("d_model", 128), device)
+        encoder = t5_encoder.load_t5_encoder(cfg.get("t5_model_name", "t5-small"), device)
         encoder_trainable = ckpt_state["extra_state"].get("encoder_trainable")
         assert encoder_trainable, "checkpoint's config says encoder_kind=t5 but has no saved encoder_trainable state"
         encoder.load_trainable_state_dict(encoder_trainable)
 
     meta = ds.load_meta(args.data_dir)
-    l_tgt = cfg.get("l_tgt", meta["l_tgt"])  # DLM+T5 checkpoints save their own l_tgt_t5 here
+    l_tgt = cfg.get("l_tgt", meta["l_tgt"])  # T5-vocab checkpoints (DLM+T5, ARLM+T5) save their own l_tgt_t5 here
 
     if args.model_kind == "dlm":
         model = dlm_module.DLMDecoder(
@@ -82,18 +82,24 @@ def main():
             l_tgt=l_tgt, d_model=encoder.d_model, n_layers=cfg.get("n_layers", 2), n_heads=cfg.get("n_heads", 8),
             d_mlp=cfg.get("d_mlp", 512), dropout=cfg.get("dropout", 0.1), embedding=encoder.embedding,
         ).to(device)
-        sample_kwargs = {}
+        sample_kwargs = (
+            {"start_id": encoder.t5_tokenizer.pad_token_id, "eos_id": encoder.t5_tokenizer.eos_token_id,
+             "pad_id": encoder.t5_tokenizer.pad_token_id}
+            if encoder_kind == "t5" else {}
+        )
     model.load_state_dict(ckpt_state["model_state"])
     model.eval()
     print(f"loaded {args.model_kind} checkpoint from {args.checkpoint} (step {ckpt_state.get('step')})")
 
-    # eval_decoder is what actually gets handed to metrics.run_eval -- for DLM+T5 this
-    # is the raw model wrapped so its T5-vocab generations still speak the project's own
-    # vocab to metrics.py/viz.py (see T5SpaceDLMAdapter's docstring); every other
-    # combination evaluates the raw model directly, unchanged.
+    # eval_decoder is what actually gets handed to metrics.run_eval -- for T5-vocab
+    # decoders (DLM+T5, ARLM+T5) this is the raw model wrapped so its T5-vocab
+    # generations still speak the project's own vocab to metrics.py/viz.py (see
+    # T5SpaceDecoderAdapter's docstring); every other combination evaluates the raw
+    # model directly, unchanged. ARLM's raw generation carries an extra prepended
+    # decoder-start marker the DLM's doesn't, hence drop_first_token.
     eval_decoder = (
-        t5_encoder.T5SpaceDLMAdapter(model, encoder.t5_tokenizer)
-        if args.model_kind == "dlm" and encoder_kind == "t5" else model
+        t5_encoder.T5SpaceDecoderAdapter(model, encoder.t5_tokenizer, drop_first_token=(args.model_kind == "arlm"))
+        if encoder_kind == "t5" else model
     )
 
     splits = {"id": "val_id.pt", "ood": "val_ood.pt"} if args.split == "both" else {args.split: f"val_{args.split}.pt"}

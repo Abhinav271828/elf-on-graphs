@@ -172,11 +172,15 @@ def encode_context(encoder: torch.nn.Module, input_ids: torch.Tensor,
     accumulate gradient via this conditioning path, only via the decoder's own target
     embedding lookups).
 
-    T5GraphEncoder re-tokenizes the graph as text, so its output has its own length/mask
-    and returns both directly as a tuple; it sets `context_requires_grad = True` and
-    manages its own internal no_grad scope around the frozen T5 stack, since gradient
-    must still flow to its trainable projection/embedding -- so it must NOT be wrapped
-    in no_grad here."""
+    T5GraphEncoder/T5DiffusionEncoder re-tokenize the graph as text, so their output has
+    its own length/mask and returns both directly as a tuple. Both leave
+    `context_requires_grad` at its default (False, wrapped in no_grad here) since
+    neither has any trainable parameter upstream of its own returned context anymore
+    (T5GraphEncoder's only trainable piece, `embedding`, is downstream -- consumed by
+    the decoder's own target-embedding lookups, not produced by this forward pass;
+    T5DiffusionEncoder has no trainable parameters at all). `T5GraphEncoder.forward`
+    still manages its own internal no_grad scope around the frozen T5 stack regardless,
+    for clarity at the call site rather than relying solely on this wrapper."""
     if getattr(encoder, "context_requires_grad", False):
         out = encoder(input_ids, input_mask)
     else:

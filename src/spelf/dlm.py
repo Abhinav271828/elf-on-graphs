@@ -72,11 +72,33 @@ def _apply_context_dropout(context: torch.Tensor, null_context: nn.Parameter,
 def loss(model: DLMDecoder, context: torch.Tensor, context_mask: torch.Tensor,
           target_ids: torch.Tensor, cfg_dropout_prob: float = 0.1,
           decode_branch_prob: float = 0.2, selfcond_prob: float = 0.0,
-          lambda_ce: float = 1.0, eps: float = 1e-5) -> dict:
+          lambda_ce: float = 1.0, eps: float = 1e-5, pad_id: int = tok.PAD) -> dict:
     """One training step's loss. Per-example branch assignment (denoise vs decode) is
     sampled once per batch; both branches run through a single shared forward pass
     (mode varies per example), then each example's loss term is routed to the matching
-    objective (reweighted MSE for denoise, cross-entropy for decode)."""
+    objective (reweighted MSE for denoise, cross-entropy for decode).
+
+    Both `denoise_loss` and `decode_loss` exclude `pad_id` positions (mean taken over
+    each example's own real, non-pad positions only, not the full L_TGT canvas) --
+    matching the canonical ELF reference implementation (github.com/lillian039/ELF,
+    src/train_step.py), verified directly against its source rather than assumed: it
+    builds one `loss_mask` from the batch's attention mask and applies that *same* mask
+    to both its L2/denoising loss (`reduce_token_loss`) and its CE/decode loss, when the
+    model uses a dedicated pad token distinct from EOS (this project's tokenizer always
+    does). The paper's own equations don't show this (Eq. 1/2 carry no masking
+    notation), so this detail only came from reading the actual code, not the paper.
+
+    Excluding pad from `denoise_loss` too means the model is never trained on what
+    embedding belongs at trailing positions past `<EOS>` -- deliberately: nothing needs
+    it to be `<PAD>` specifically, since decode_target/decode_t5_path_ids read a
+    generation by finding the first `<EOS>` and ignoring everything after it, not by
+    validating that the tail is literal padding (this parsing relaxation is the
+    necessary companion change -- without it, a DLM generation's untrained tail would
+    almost never happen to equal literal `<PAD>` by chance, and every generation would
+    be marked invalid regardless of whether its real content was correct). This is also
+    why full-canvas denoise supervision was wrong to keep in the first place: it was
+    spending capacity teaching the model an arbitrary convention nothing downstream
+    actually checks."""
     B, L = target_ids.shape
     device = target_ids.device
 
@@ -102,13 +124,17 @@ def loss(model: DLMDecoder, context: torch.Tensor, context_mask: torch.Tensor,
 
     x_hat = model(z_t, t, context, context_mask, mode, self_cond=self_cond)
 
+    real_mask = (target_ids != pad_id).float()  # [B, L] -- shared by both branches, see docstring
+    n_real = real_mask.sum(dim=1).clamp(min=1)  # [B]
+
     sq_err = (x_hat - x) ** 2  # [B, L, D]
     weight = (1.0 / ((1 - t) ** 2 + eps))[:, None, None]
-    denoise_terms = (weight * sq_err).mean(dim=(1, 2))  # [B]
+    per_position_sq_err = (weight * sq_err).mean(dim=-1)  # [B, L], mean over D only
+    denoise_terms = (per_position_sq_err * real_mask).sum(dim=1) / n_real  # mean over real positions only
 
     logits = model.embedding.unembed(x_hat)  # [B, L, vocab]
-    ce = F.cross_entropy(logits.transpose(1, 2), target_ids, reduction="none")  # [B, L]
-    decode_terms = ce.mean(dim=1)  # [B]
+    ce = F.cross_entropy(logits.transpose(1, 2), target_ids, ignore_index=pad_id, reduction="none")  # [B, L], 0 at pad_id positions
+    decode_terms = ce.sum(dim=1) / n_real  # mean over each example's own real (non-pad) positions only
 
     denoise_mask = is_denoise.float()
     decode_mask = (~is_denoise).float()

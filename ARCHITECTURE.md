@@ -47,7 +47,7 @@ depends on a completed encoder checkpoint, because both `train_dlm.py` and
 | [`src/spelf/dataset.py`](src/spelf/dataset.py) | Thin `torch.utils.data.Dataset` wrappers around the cached tensors. |
 | [`src/spelf/modules.py`](src/spelf/modules.py) | Shared building blocks: `SharedEmbedding`, `LearnedPosEnc`, `TimeEmbedding`, `EncoderLayer`, `DecoderLayer`. |
 | [`src/spelf/encoder.py`](src/spelf/encoder.py) | `GraphEncoder` + its masked-language-model (MLM) pretraining objective. |
-| [`src/spelf/t5_encoder.py`](src/spelf/t5_encoder.py) | Optional T5-based encoders: `T5GraphEncoder` (conditioning-only, ARLM) and `T5DiffusionEncoder` (diffuses directly in T5's own frozen embedding space, DLM — matches canonical ELF's actual use of T5) — see §6.5. |
+| [`src/spelf/t5_encoder.py`](src/spelf/t5_encoder.py) | Optional T5-based encoders: `T5GraphEncoder` (T5 conditions AND the ARLM decodes into T5's own vocab) and `T5DiffusionEncoder` (T5 conditions AND the DLM diffuses directly in T5's own frozen embedding space — matches canonical ELF's actual use of T5) — see §6.5. |
 | [`src/spelf/dlm.py`](src/spelf/dlm.py) | `DLMDecoder` — ELF-style rectified-flow diffusion decoder (loss + Euler sampler). |
 | [`src/spelf/arlm.py`](src/spelf/arlm.py) | `GPTDecoder` — causal autoregressive decoder (loss + greedy sampler). |
 | [`src/spelf/muon.py`](src/spelf/muon.py) | `Muon` optimizer — the canonical ELF implementation's optimizer for the DLM's own hidden weight matrices (verified against arXiv:2605.10938 directly; see §6.8). |
@@ -156,10 +156,12 @@ Target:     <P> p0 p1 ... p(L-1) <EOS> <PAD> <PAD> ...
   have one constant shape too.
 - `decode_input`/`decode_target` are the **single source of truth** for parsing ids back
   into a graph/path — used identically for ground truth (at data-generation time) and
-  for possibly-malformed model output (at eval time). Both return `None` on any
+  for possibly-malformed model output (at eval time). Both return `None` on a
   structural violation (missing/duplicated markers, non-node tokens in the wrong place,
-  content after `<EOS>`/`<N>`-list, etc.) rather than raising, so a broken generation is
-  just scored as invalid, never crashes an eval loop.
+  content after the `<N>`-list, etc.) rather than raising, so a broken generation is
+  just scored as invalid, never crashes an eval loop. `decode_target` is the one
+  exception to "content after a marker is rejected": content after `<EOS>` is
+  truncated, not validated — see §6.6 for why.
 
 ## 5. Data-generation design decisions
 
@@ -351,27 +353,73 @@ source for *both* decoders, which is a reasonable, ordinary choice for the ARLM 
 not reflect what the canonical ELF paper (arXiv:2605.10938) actually does with T5 for a
 diffusion decoder — verified directly against the paper before making this distinction.
 
-**`T5GraphEncoder`** (used by `GPTDecoder` + T5) — T5 as a pure *conditioning source*.
-Key differences from `GraphEncoder`, all consequences of T5 operating on natural-language
-subwords rather than this project's own 21-token graph vocab:
+**`T5GraphEncoder`** (used by `GPTDecoder` + T5) — T5 as a conditioning source, and (see
+below) also as the decoder's own output vocabulary. Originally used a trainable `proj:
+nn.Linear(t5_hidden, d_model)` plus a *tied* `SharedEmbedding` over this project's own
+21-token vocab (mirroring `GraphEncoder`'s convention); both were revisited and changed
+across two rounds of the same conversation that added `T5DiffusionEncoder` — first
+dropping `proj`/tying (neither was load-bearing here), then switching the decoder's own
+target vocabulary from this project's 21 tokens to T5's own ~32k, once there was no
+longer a reason to keep the small vocabulary around at all. Key properties now:
 - `T5GraphEncoder.forward` first serializes the decoded graph to an English sentence
   (`graph_to_text`) and retokenizes with T5's own tokenizer — so its output
   sequence length/mask are **unrelated** to `input_mask`, unlike `GraphEncoder` (whose
   output is length-aligned with its own input). This is exactly why
   `common.encode_context` exists as a uniform dispatch point rather than every call site
   assuming `context_mask := input_mask`.
-- It owns its *own* fresh `SharedEmbedding` over the graph vocab (trained from scratch
-  alongside the decoder) plus a trainable `nn.Linear` projection from T5's hidden size
-  down to a freely-chosen `d_model` — only those two pieces train; the pretrained T5
-  stack itself stays frozen (`T5GraphEncoder.freeze`) and its `.train()` is overridden so
-  a stray recursive `.train()` call from a parent module can never toggle its dropout
-  back on.
-- `context_requires_grad = True` (checked by `common.encode_context`) because gradient
-  must still flow to `proj`/`embedding` even though the T5 forward pass itself runs
-  under `torch.no_grad()` internally.
-- `trainable_state_dict()`/`load_trainable_state_dict()` checkpoint only `proj` and
-  `embedding` — the frozen T5 stack is fully reproducible from `--t5_model_name` alone,
-  so re-saving tens of millions of frozen params on every checkpoint would be pure waste.
+- **No `proj` layer.** Same reasoning as `T5DiffusionEncoder` (§6.5 below): T5's
+  embedding dimension and hidden-state dimension are the same throughout its stack, so
+  `self.d_model = self.t5.config.d_model` (derived, not a free CLI choice) and
+  `last_hidden_state` is used directly as cross-attention context — tying the two
+  systems' dimension the same way the DLM's does. `GPTDecoder`'s own `d_model` must
+  therefore match T5's exactly.
+- **`self.embedding` is `UntiedEmbedding`, sized to T5's vocabulary, not
+  `SharedEmbedding`.** `GPTDecoder` now decodes directly *into T5's own ~32k-token
+  vocabulary* (`vocab_size = len(self.t5_tokenizer)`, the tokenizer's real, tight usable
+  id range — not `T5EncoderModel`'s embedding table size, 32128 for t5-small, which is
+  merely rounded up for hardware efficiency and includes rows the tokenizer can never
+  actually produce) rather than this project's own 21-token one; training targets are
+  T5's own tokenization of `path_to_text(path)` (`T5GraphEncoder.tokenize_path_targets`,
+  mirroring `T5DiffusionEncoder.tokenize_path_targets` below, but prepending T5's own
+  `pad_token_id` as a decoder-start marker — T5 has no dedicated BOS token, so this
+  mirrors the standard `decoder_start_token_id = pad_token_id` T5/seq2seq convention).
+  Despite now sharing T5's vocabulary, there is still no pretrained embedding space
+  worth tying into: T5's own embedding table is a separate, frozen object entirely
+  (never referenced by `UntiedEmbedding`), and an autoregressive decoder's output
+  vocabulary being T5-shaped doesn't make T5's own embeddings the right *values* to
+  start from. `UntiedEmbedding` is an ordinary `nn.Embedding(vocab_size, d_model)`
+  (input) + a separate `nn.Linear(d_model, vocab_size)` (`lm_head`, output) — genuinely
+  independent parameters, no weight tying at all, exactly what a from-scratch GPT
+  decoder head normally looks like, just aimed at a much larger target. Both pieces
+  train from scratch; the T5 stack itself stays frozen (`T5GraphEncoder.freeze`), and
+  `.train()` is overridden so a stray recursive `.train()` call from a parent module can
+  never toggle its dropout back on.
+- **`l_tgt_t5 = compute_l_tgt_t5(t5_tokenizer) + 1`** — the `+1` (beyond
+  `T5DiffusionEncoder`'s own use of the same helper) accounts for the prepended
+  decoder-start marker. `tokenize_path_targets` asserts (rather than silently
+  truncating) if a real path's tokenization plus that marker would exceed it.
+- **Generation start/stop/pad ids are no longer `tokenizer.P`/`EOS`/`PAD`.**
+  `arlm.loss`/`arlm.sample`/`GPTDecoder.generate` were parameterized
+  (`pad_id`/`start_id`/`eos_id`, all defaulting to the project-vocab constants for
+  backward compatibility with `--encoder_kind custom`) rather than hardcoding them, so
+  `train_arlm.py`/`eval_only.py`/`eval_venn.py` pass T5's own `pad_token_id` (for both
+  `start_id` and `pad_id`) and `eos_token_id` when `--encoder_kind t5`. `arlm.py` itself
+  needed this parameterization — unlike `dlm.py` (never touched by the DLM's own T5
+  redesign, since nothing inside `dlm.sample`'s loop hardcodes a vocab-specific
+  sentinel) — because the autoregressive sampling loop bakes the start/stop tokens
+  directly into its generation logic, not just into the surrounding data pipeline.
+- `context_requires_grad = False` (checked by `common.encode_context`) — nothing
+  upstream of the returned `(context, context_mask)` is trainable anymore (`embedding`
+  is downstream, consumed by the decoder's own lookups, not produced by this forward
+  pass), so the whole forward pass can safely run under `torch.no_grad()` from the
+  caller's side, same as `GraphEncoder`/`T5DiffusionEncoder`.
+- `trainable_state_dict()`/`load_trainable_state_dict()` checkpoint only `embedding` —
+  the frozen T5 stack is fully reproducible from `--t5_model_name` alone, so re-saving
+  tens of millions of frozen params on every checkpoint would be pure waste. (This
+  changed the ARLM+T5 checkpoint schema — an ARLM+T5 checkpoint saved before this change
+  has `{"proj": ..., "embedding": ...}` here and a `d_model=128`-shaped `model_state`;
+  neither loads cleanly against the current code, since both the parameter shapes and
+  the trainable-state dict's keys changed.)
 
 **`T5DiffusionEncoder`** (used by `DLMDecoder` + T5) — T5 as the DLM's actual diffusion
 space, matching what the canonical ELF paper does: the DLM diffuses directly in T5's own
@@ -416,28 +464,28 @@ frozen token embedding table, not a separately-trained small one. Concretely:
   tokenizer (the old unspaced format really does fuse some node-id pairs into a single
   token, e.g. `"1-4"`; the spaced format never does), and `scripts/inspect_t5_tokenization.py`
   re-verifies it automatically against real dataset examples every time it's run (see §9).
-- `DLMDecoder`'s own generations, in T5-vocab-id space, are unreadable to
-  `metrics.py`/`viz.py` as-is. `T5SpaceDLMAdapter` wraps the raw model so it exposes the
-  exact same `.generate(context, context_mask, **kwargs) -> LongTensor[B,
+- Both `DLMDecoder` and (now) `GPTDecoder`'s raw T5-vocab-id generations are unreadable
+  to `metrics.py`/`viz.py` as-is. `T5SpaceDecoderAdapter` wraps either one so it exposes
+  the exact same `.generate(context, context_mask, **kwargs) -> LongTensor[B,
   tokenizer.TARGET_LENGTH]` interface (in the *project's own vocab*) every other decoder
   exposes: it detokenizes a generation via `decode_t5_path_ids`, and re-encodes a
   successfully parsed path via `tokenizer.encode_target` — an unparseable generation (or
   one whose path is too long for `TARGET_LENGTH`) is left as an all-`<PAD>` row, which
   `tokenizer.decode_target` already treats as invalid (its first required token is
   `<P>`). This is what lets `metrics.run_eval`/`viz.plot_example` stay completely
-  unaware T5 was ever involved — `train_dlm.py`/`eval_only.py`/`eval_venn.py` construct
-  this adapter locally and pass it wherever a decoder is handed to `metrics.run_eval`,
-  never to `dlm.loss` (training loss always operates on the raw model with real T5-space
-  target ids).
+  unaware T5 was ever involved — `train_dlm.py`/`train_arlm.py`/`eval_only.py`/
+  `eval_venn.py` construct this adapter locally and pass it wherever a decoder is handed
+  to `metrics.run_eval`, never to `dlm.loss`/`arlm.loss` (training loss always operates
+  on the raw model with real T5-space target ids). `drop_first_token=True` (ARLM only)
+  strips `arlm.sample`'s prepended decoder-start marker before decoding — the DLM's raw
+  generation has no such marker, so it defaults to `False`.
 - `decode_t5_path_text`/`decode_t5_path_ids` are the T5-space analogues of
   `tokenizer.decode_target` — same division of responsibility (format parsing only, not
   semantic path validity) and same strictness about trailing content after the stop
   marker (`</s>`/`<pad>` here, `<EOS>`/`<PAD>` there).
 
 Both T5 classes require `transformers`/`sentencepiece` (see
-[`requirements.txt`](requirements.txt)), otherwise unused. `train_arlm.py` is completely
-unaffected by `T5DiffusionEncoder`'s introduction — it still builds `T5GraphEncoder`
-exactly as before.
+[`requirements.txt`](requirements.txt)), otherwise unused.
 
 ### 6.6 DLMDecoder: ELF-style rectified-flow decoder
 
@@ -466,14 +514,31 @@ training branches), and an optional self-conditioning input.
 6. **Loss routing**: denoise-branch examples get reweighted MSE
    `(1/((1-t)^2+eps))·‖x_hat - x‖^2` (the reweighting emphasizes small `t`, i.e. noisier
    inputs — standard for x-prediction rectified-flow training); decode-branch examples
-   get cross-entropy on `unembed(x_hat)` against `target_ids`. **Both branches' losses
-   are computed over all `L_TGT` positions, including `<PAD>`** — this is the direct
-   answer to "why doesn't the DLM have a per-step token accuracy like the ARLM does": the
-   DLM has no autoregressive stopping mechanism, so it must learn to place
-   `<EOS>`/`<PAD>` itself, and there's no natural "predict the next token" framing to
-   score a training-time accuracy against (see the eval-time `token_accuracy`/
-   `token_accuracy_nopad` in `metrics.py` instead — those work identically for both
-   models because they score real `.generate()` output, not training-step logits).
+   get cross-entropy on `unembed(x_hat)` against `target_ids`. **Both `denoise_loss` and
+   `decode_loss` exclude `pad_id` positions** (default `tok.PAD`) — the per-example mean
+   for each is taken over that example's own real (non-pad) position count, computed
+   once as a shared `real_mask`/`n_real` (mirroring `metrics.py`'s `token_accuracy_nopad`
+   pattern). This was originally decode-only (an earlier iteration of this file reasoned
+   that `denoise_loss` needed to stay unmasked to teach the model where `<PAD>` belongs,
+   since the DLM has no autoregressive stop-and-fill mechanism the way `arlm.sample` has
+   — see §6.7); that reasoning was superseded after checking the actual canonical ELF
+   implementation's source (github.com/lillian039/ELF, `src/train_step.py`, not just its
+   paper — the paper's own loss equations show no masking either way). Its reference
+   code builds one `loss_mask` from the batch's real-content mask and applies that same
+   mask to *both* its L2/denoising loss and its CE/decode loss whenever the tokenizer
+   uses a dedicated pad token distinct from EOS (this project's tokenizer always does).
+   The resolution to the original concern: the model doesn't need to learn what belongs
+   after `<EOS>` at all, because nothing downstream checks it — `tokenizer.decode_target`
+   (and `t5_encoder.decode_t5_path_ids`) read a generation by truncating at the first
+   `<EOS>`, not by validating that the tail is literal `<PAD>` (this parsing relaxation
+   is the necessary companion change; without it, a DLM generation's untrained,
+   effectively-arbitrary tail would almost never happen to equal literal `<PAD>` by
+   chance, marking every generation invalid regardless of whether its real content was
+   correct — see §4). Masking `denoise_loss` too also incidentally fixes the original
+   motivating symptom (`decode_loss` collapsing toward exact `0.0` within ~100 steps,
+   well before the model had learned real path content, because most of a `L_TGT`
+   canvas is padding and placing it correctly is a far easier pattern to learn first) at
+   its root, rather than only hiding it from one of the two loss terms.
 
 `dlm.sample` (inference): `z_0 ~ N(0,I)` over `[B, L_TGT, D]`; Euler-integrates
 `dz/dt = (x_hat - z)/(1 - t + eps)` for `num_sample_steps` (default 32) equal steps from
@@ -501,12 +566,18 @@ per-training-step `train/token_accuracy` scalar that only `train_arlm.py` logs (
 as a byproduct of `arlm.loss`'s teacher-forced logits, which `dlm.loss` has no equivalent
 of).
 
-`arlm.sample`: greedy (`argmax`) autoregressive decoding starting from `<P>`, one token
-at a time, stopping per-example at the first `<EOS>` (tracked via a `finished` mask so
-already-finished examples in a batch get forced to emit `<PAD>` rather than continuing to
-decode past their own `<EOS>`), or at `max_len` (defaults to `l_tgt`). No KV-cache — the
-full forward pass is recomputed every step; explicitly noted as negligible cost at this
-scale (2 layers, `d_model=128`, `L_TGT<=16`).
+`arlm.sample`: greedy (`argmax`) autoregressive decoding starting from `start_id`, one
+token at a time, stopping per-example at the first `eos_id` (tracked via a `finished`
+mask so already-finished examples in a batch get forced to emit `pad_id` rather than
+continuing to decode past their own stop token), or at `max_len` (defaults to `l_tgt`).
+No KV-cache — the full forward pass is recomputed every step; explicitly noted as
+negligible cost at this scale (2 layers, `d_model` 128-512, `l_tgt` up to ~55).
+`start_id`/`eos_id`/`pad_id` (and `loss`'s `pad_id`) default to `tok.P`/`tok.EOS`/
+`tok.PAD` (this project's own vocab, `--encoder_kind custom`); `train_arlm.py`/
+`eval_only.py`/`eval_venn.py` pass T5's own `pad_token_id`/`eos_token_id` instead when
+`--encoder_kind t5` (§6.5) — `arlm.py` needed this parameterization (unlike `dlm.py`,
+untouched by either T5 redesign) because the sampling loop bakes its stop condition
+directly into the generation logic, not just into the surrounding data pipeline.
 
 ### 6.8 DLM optimizer: Muon + AdamW hybrid
 
@@ -727,7 +798,7 @@ name, its default may differ between them (noted inline).
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--d_model` | 128 | Hidden size. `train_arlm.py`: only used when `--encoder_kind t5` (custom mode infers it from `--encoder_ckpt`). **Not present in `train_dlm.py`** — `d_model` there is always derived (from `--encoder_ckpt` in custom mode, from the T5 model's own `config.d_model` in t5 mode, §6.5), never a free choice, so there's nothing for a flag to override. |
+| `--d_model` | 128 | `pretrain_encoder.py` only. **Not present in `train_dlm.py` or `train_arlm.py`** — for both, `d_model` is always derived (from `--encoder_ckpt` in custom mode, from the T5 model's own `config.d_model` in t5 mode, §6.5), never a free choice, so there's nothing for a flag to override. |
 | `--n_layers` | 2 | Transformer layers (encoder or decoder, per script). |
 | `--n_heads` | 8 | Attention heads. |
 | `--d_mlp` | 512 | MLP hidden size. |
@@ -737,7 +808,7 @@ name, its default may differ between them (noted inline).
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--encoder_kind` | `custom` | `custom` = this project's `GraphEncoder` (`--encoder_ckpt` required). `t5` = frozen pretrained T5 — `T5GraphEncoder` (conditioning-only) for `train_arlm.py`, `T5DiffusionEncoder` (diffuses in T5's own embedding space) for `train_dlm.py` (§6.5). |
+| `--encoder_kind` | `custom` | `custom` = this project's `GraphEncoder` (`--encoder_ckpt` required), decoder targets this project's own vocab. `t5` = frozen pretrained T5 conditions AND the decoder targets T5's own vocab/embedding space instead — `T5GraphEncoder` for `train_arlm.py`, `T5DiffusionEncoder` for `train_dlm.py` (§6.5). |
 | `--encoder_ckpt` | `None` | Path to a `pretrain_encoder.py` checkpoint; required iff `--encoder_kind custom`. |
 | `--t5_model_name` | `t5-small` | HuggingFace T5 checkpoint name; used iff `--encoder_kind t5`. |
 
@@ -938,12 +1009,38 @@ project's original plan):
   node-id number share a token with a different one (checked via the tokenizer's own
   offset mapping), including a regression check confirming the *old* unspaced format
   really does fail this for some inputs (so the check is known to be meaningful, not
-  vacuous); `decode_t5_path_text`/`decode_t5_path_ids` round-trip real tokenizations and
-  reject malformed input the same way `tokenizer.decode_target` does;
+  vacuous); `decode_t5_path_text`/`decode_t5_path_ids` round-trip real tokenizations,
+  reject genuinely malformed input, and — mirroring `tokenizer.decode_target`'s own
+  relaxation (§4/§6.6) — tolerate (truncate, don't reject) content after `<EOS>`;
   `compute_l_tgt_t5`'s worst-case bound holds against 50 random paths;
   `T5TiedEmbedding` is a parameter-free view onto T5's own embedding table;
-  `T5DiffusionEncoder` has zero trainable parameters; `T5SpaceDLMAdapter` round-trips a
-  well-formed generation back to the correct path and never crashes on garbage input.
+  `T5DiffusionEncoder` has zero trainable parameters; `T5SpaceDecoderAdapter`
+  round-trips a well-formed generation back to the correct path for both
+  `drop_first_token` settings (and correctly *fails* to recover the path when
+  `drop_first_token` is wrongly left `False` against an ARLM-shaped generation, which is
+  what confirms the flag is actually doing something) and never crashes on garbage
+  input; `UntiedEmbedding`'s embed/unembed are genuinely independent (different weight
+  tensors, and gradient through `unembed` never reaches `tok_embedding`);
+  `T5GraphEncoder` has no `proj` attribute, derives `d_model` from T5's own config, has
+  an `UntiedEmbedding` sized to `len(t5_tokenizer)`, and its only trainable parameters
+  are exactly that embedding's three (`tok_embedding.weight`, `lm_head.weight`,
+  `lm_head.bias`) — nothing from T5 itself leaks through;
+  `T5GraphEncoder.tokenize_path_targets` prepends T5's own `pad_token_id` and pads to
+  `l_tgt_t5`, and the result round-trips back to the original path via
+  `decode_t5_path_ids` once that prefix is dropped; `arlm.sample`/`arlm.loss` accept
+  custom `start_id`/`eos_id`/`pad_id` while still defaulting to this project's own
+  `tok.P`/`tok.EOS`/`tok.PAD` for backward compatibility.
+- `test_dlm.py` — `dlm.loss`'s pad-exclusion masking (§6.6), for both loss terms: the
+  exact `ignore_index`-plus-per-example-real-count arithmetic matches a hand-computed
+  reference (including a degenerate all-`<PAD>` row); a real (tiny) `DLMDecoder`'s
+  `decode_loss` *and* separately its `denoise_loss` each genuinely differ between the
+  default `pad_id` (matching the target's real `<PAD>` marker) and a `pad_id` that
+  never appears in the target (nothing masked), proving the masking has an actual
+  effect on both branches rather than being a no-op; an all-`<PAD>` target produces a
+  finite (not NaN/Inf) loss for both branches.
+- `test_tokenizer_roundtrip.py` also covers `decode_target`'s relaxed handling of
+  content after `<EOS>` (truncated, not rejected — §4/§6.6), alongside its existing
+  round-trip and malformed-input coverage.
 
 Run with `pytest tests/ -q` from the repo root (after `pip install -r requirements.txt`).
 `test_t5_encoder.py` downloads/loads a real `t5-small` tokenizer and encoder model on

@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import torch
 from torch.utils.data import DataLoader
 
-from spelf import common, dataset as ds, dlm as dlm_module, metrics, viz
+from spelf import common, dataset as ds, dlm as dlm_module, metrics, tokenizer as tok, viz
 from spelf.encoder import load_frozen_encoder
 from spelf import t5_encoder
 
@@ -161,9 +161,9 @@ def main():
     config = vars(args) | {"l_in": l_in, "l_tgt": l_tgt, "vocab_size": vocab_size, "d_model": d_model}
     # eval_decoder is what metrics.run_eval actually calls .generate() on: in T5-diffusion
     # mode this is the raw model wrapped so it still speaks the project's own vocab to
-    # every downstream consumer (metrics.py, viz.py) -- see T5SpaceDLMAdapter's docstring.
+    # every downstream consumer (metrics.py, viz.py) -- see T5SpaceDecoderAdapter's docstring.
     eval_decoder = (
-        t5_encoder.T5SpaceDLMAdapter(model, encoder.t5_tokenizer) if args.encoder_kind == "t5" else model
+        t5_encoder.T5SpaceDecoderAdapter(model, encoder.t5_tokenizer) if args.encoder_kind == "t5" else model
     )
 
     start_step = 0
@@ -226,15 +226,17 @@ def main():
         # own vocab -- see T5DiffusionEncoder.tokenize_path_targets.
         if args.encoder_kind == "t5":
             target_ids = encoder.tokenize_path_targets(batch["target_ids"], device)
+            pad_id = encoder.t5_tokenizer.pad_token_id
         else:
             target_ids = batch["target_ids"].to(device)
+            pad_id = tok.PAD
 
         context, context_mask = common.encode_context(encoder, input_ids, input_mask)
 
         optimizer.zero_grad()
         out = dlm_module.loss(
             model, context, context_mask, target_ids, cfg_dropout_prob=args.cfg_dropout,
-            decode_branch_prob=args.decode_branch_prob, selfcond_prob=args.selfcond_prob,
+            decode_branch_prob=args.decode_branch_prob, selfcond_prob=args.selfcond_prob, pad_id=pad_id,
             lambda_ce=args.lambda_ce,
         )
         out["loss"].backward()

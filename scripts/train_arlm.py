@@ -15,9 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import torch
 from torch.utils.data import DataLoader
 
-from spelf import arlm as arlm_module, common, dataset as ds, metrics, viz
+from spelf import arlm as arlm_module, common, dataset as ds, metrics, tokenizer as tok, viz
 from spelf.encoder import load_frozen_encoder
-from spelf.t5_encoder import load_t5_encoder
+from spelf import t5_encoder
 
 
 def infinite_loader(loader: DataLoader):
@@ -31,16 +31,22 @@ def main():
     p.add_argument("--data_dir", type=str, default="data")
     p.add_argument("--encoder_kind", type=str, default="custom", choices=["custom", "t5"],
                     help="'custom' conditions on this project's own pretrained GraphEncoder "
-                         "(--encoder_ckpt required). 't5' conditions on a frozen pretrained "
-                         "HuggingFace T5 encoder over a text serialization of the graph instead "
-                         "(--encoder_ckpt ignored; see --t5_model_name).")
+                         "(--encoder_ckpt required), decoding into this project's own 21-token "
+                         "vocab. 't5' conditions on a frozen pretrained HuggingFace T5 encoder "
+                         "over a text serialization of the graph instead (--encoder_ckpt "
+                         "ignored; see --t5_model_name) -- T5's own contextualized hidden states "
+                         "are used directly as cross-attention context (no projection layer), so "
+                         "d_model is always T5's own hidden size; the decoder ALSO decodes "
+                         "directly into T5's own vocabulary (targets are T5's own tokenization of "
+                         "a serialized path text), via untied, ordinary, independently-trained "
+                         "embedding/unembedding matrices with no weight tying to each other or to "
+                         "T5's own embedding table (see t5_encoder.T5GraphEncoder's docstring).")
     p.add_argument("--encoder_ckpt", type=str, default=None,
                     help="required when --encoder_kind=custom")
     p.add_argument("--t5_model_name", type=str, default="t5-small",
-                    help="HuggingFace T5 checkpoint name, used when --encoder_kind=t5")
-    p.add_argument("--d_model", type=int, default=128,
-                    help="only used when --encoder_kind=t5 (custom mode infers d_model "
-                         "from --encoder_ckpt)")
+                    help="HuggingFace T5 checkpoint name, used when --encoder_kind=t5. There is "
+                         "no --d_model flag here -- it's always derived (from --encoder_ckpt in "
+                         "custom mode, from the T5 model's own hidden size in t5 mode).")
     p.add_argument("--run_dir", type=str, default="runs/arlm")
     p.add_argument("--resume", type=str, default="latest")
     p.add_argument("--seed", type=int, default=0)
@@ -82,15 +88,36 @@ def main():
         d_model = encoder.d_model
         print(f"loaded frozen custom encoder from {args.encoder_ckpt} (d_model={d_model})")
     else:
-        encoder = load_t5_encoder(args.t5_model_name, args.d_model, device)
+        # Cross-attention context is T5's own hidden states directly (no projection).
+        # Decoder also decodes into T5's own vocabulary -- l_tgt_t5 replaces
+        # meta["l_tgt"], and generation start/stop/pad ids come from T5's tokenizer, not
+        # this project's own <P>/<EOS>/<PAD> (see t5_encoder.T5GraphEncoder).
+        encoder = t5_encoder.load_t5_encoder(args.t5_model_name, device)
         d_model = encoder.d_model
-        print(f"loaded frozen T5 encoder '{args.t5_model_name}' "
-              f"(t5 hidden={encoder.t5.config.d_model} -> projected d_model={d_model})")
+        l_tgt = encoder.l_tgt_t5
+        print(f"loaded frozen T5 encoder '{args.t5_model_name}' -- cross-attention context is "
+              f"T5's own hidden states directly (d_model={d_model}); decoder also decodes into "
+              f"T5's own vocabulary (l_tgt_t5={l_tgt}) via untied, from-scratch embedding/unembedding "
+              f"(vs. this project's own vocab_size={vocab_size}, l_tgt={meta['l_tgt']})")
 
     model = arlm_module.GPTDecoder(
         l_tgt=l_tgt, d_model=d_model, n_layers=args.n_layers, n_heads=args.n_heads,
         d_mlp=args.d_mlp, dropout=args.dropout, embedding=encoder.embedding,
     ).to(device)
+    sample_kwargs = (
+        {"start_id": encoder.t5_tokenizer.pad_token_id, "eos_id": encoder.t5_tokenizer.eos_token_id,
+         "pad_id": encoder.t5_tokenizer.pad_token_id}
+        if args.encoder_kind == "t5" else {}
+    )
+    # eval_decoder is what metrics.run_eval actually calls .generate() on: in T5-vocab
+    # mode this is the raw model wrapped so its T5-vocab generations still speak the
+    # project's own vocab to metrics.py/viz.py (see T5SpaceDecoderAdapter's docstring);
+    # drop_first_token=True strips arlm.sample's prepended decoder-start marker before
+    # T5-decoding a generation.
+    eval_decoder = (
+        t5_encoder.T5SpaceDecoderAdapter(model, encoder.t5_tokenizer, drop_first_token=True)
+        if args.encoder_kind == "t5" else model
+    )
 
     train_ds = ds.PathDataset(Path(args.data_dir) / "train.pt")
     val_id_ds = ds.PathDataset(Path(args.data_dir) / "val_id.pt")
@@ -115,7 +142,7 @@ def main():
     resumed_wandb_run_id = None
     ckpt_path = common.resolve_checkpoint_path(args.run_dir, args.resume)
     if ckpt_path is not None:
-        common.check_checkpoint_config(ckpt_path, {"encoder_kind": args.encoder_kind})
+        common.check_checkpoint_config(ckpt_path, {"encoder_kind": args.encoder_kind, "t5_model_name": args.t5_model_name})
         state = common.load_checkpoint(ckpt_path, model, optimizer, scheduler, map_location=device)
         start_step = state["step"] + 1
         if "early_stopper" in state["extra_state"]:
@@ -129,8 +156,8 @@ def main():
                              mode=args.wandb_mode, run_id=resumed_wandb_run_id)
 
     def do_eval(step: int, max_batches, prefix: str, log_images: bool):
-        id_res = metrics.run_eval(model, encoder, val_id_loader, device, max_batches=max_batches)
-        ood_res = metrics.run_eval(model, encoder, val_ood_loader, device, max_batches=max_batches)
+        id_res = metrics.run_eval(eval_decoder, encoder, val_id_loader, device, sample_kwargs, max_batches=max_batches)
+        ood_res = metrics.run_eval(eval_decoder, encoder, val_ood_loader, device, sample_kwargs, max_batches=max_batches)
         run.log({
             f"{prefix}/id/token_accuracy": id_res["token_accuracy"],
             f"{prefix}/id/token_accuracy_nopad": id_res["token_accuracy_nopad"],
@@ -164,12 +191,20 @@ def main():
         batch = next(data_iter)
         input_ids = batch["input_ids"].to(device)
         input_mask = batch["input_mask"].to(device)
-        target_ids = batch["target_ids"].to(device)
+        # In T5-vocab mode, target_ids must be T5's own tokenization of the serialized
+        # path text (with a decoder-start marker prepended), not the project's own
+        # vocab -- see T5GraphEncoder.tokenize_path_targets.
+        if args.encoder_kind == "t5":
+            target_ids = encoder.tokenize_path_targets(batch["target_ids"], device)
+            pad_id = encoder.t5_tokenizer.pad_token_id
+        else:
+            target_ids = batch["target_ids"].to(device)
+            pad_id = tok.PAD
 
         context, context_mask = common.encode_context(encoder, input_ids, input_mask)
 
         optimizer.zero_grad()
-        out = arlm_module.loss(model, context, context_mask, target_ids)
+        out = arlm_module.loss(model, context, context_mask, target_ids, pad_id=pad_id)
         out["loss"].backward()
         torch.nn.utils.clip_grad_norm_([p for _, p in common.trainable_parameters([model, encoder])], args.grad_clip)
         optimizer.step()

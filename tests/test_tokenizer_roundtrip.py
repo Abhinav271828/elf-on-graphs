@@ -39,14 +39,20 @@ def test_decode_target_rejects_malformed():
     # missing <EOS>
     bad = [tok.P, tok.node_tok(0), tok.node_tok(1)] + [tok.PAD] * (tok.TARGET_LENGTH - 3)
     assert tok.decode_target(bad) is None
-    # junk after <EOS>
-    bad2 = [tok.P, tok.node_tok(0), tok.EOS, tok.node_tok(2)] + [tok.PAD] * (tok.TARGET_LENGTH - 4)
-    assert tok.decode_target(bad2) is None
     # doesn't start with <P>
-    bad3 = [tok.node_tok(0), tok.EOS] + [tok.PAD] * (tok.TARGET_LENGTH - 2)
-    assert tok.decode_target(bad3) is None
+    bad2 = [tok.node_tok(0), tok.EOS] + [tok.PAD] * (tok.TARGET_LENGTH - 2)
+    assert tok.decode_target(bad2) is None
     # empty
     assert tok.decode_target([]) is None
+
+
+def test_decode_target_ignores_content_after_eos():
+    # Content after <EOS> is truncated, not validated -- see decode_target's own
+    # docstring for why (dlm.loss excludes pad positions from both its losses, so
+    # nothing trains the DLM on what belongs after <EOS>; a generation is read by
+    # finding it, not by checking its tail).
+    ids = [tok.P, tok.node_tok(0), tok.EOS, tok.node_tok(2), tok.node_tok(5)]
+    assert tok.decode_target(ids) == [0]
 
 
 def test_decode_input_rejects_malformed():

@@ -4,11 +4,20 @@ train_arlm.py / eval_only.py / eval_venn.py.
 Two distinct classes live here, because "use T5" means two different things for the
 two decoders:
 
-- `T5GraphEncoder`: T5 purely as a *conditioning source* (frozen T5 -> trainable
-  `proj` down to a freely-chosen `d_model`), while the decoder still embeds/unembeds
-  its own targets in a small, separately-trained vocabulary (`SharedEmbedding` over
-  this project's 21-token graph vocab). This is what `GPTDecoder` (train_arlm.py) uses,
-  and is a perfectly ordinary, unproblematic design for an autoregressive model.
+- `T5GraphEncoder`: T5 as a *conditioning source* for `GPTDecoder` (train_arlm.py),
+  plus -- since there's otherwise no reason left to keep this project's own small
+  vocabulary around -- the decoder generates directly *into T5's own vocabulary* too.
+  T5's own contextualized hidden states are used directly as cross-attention context --
+  no projection layer, so this encoder's own `d_model` is always T5's own hidden size,
+  tying the two systems' dimension exactly as `T5DiffusionEncoder` does below. Unlike
+  `T5DiffusionEncoder`, though, the decoder's own target-token embedding and its output
+  unembedding (`UntiedEmbedding`, sized to `len(t5_tokenizer)`) are two ordinary,
+  independently-trained matrices with no weight tying at all -- not to each other, and
+  not to T5's own (frozen) embedding table, even though they now share T5's
+  vocabulary -- exactly what a from-scratch GPT decoder head normally looks like, just
+  aimed at a bigger, T5-shaped target. (This is a deliberate design correction, made
+  after the DLM's own T5 redesign below prompted revisiting this class too -- see the
+  conversation that changed it.)
 
 - `T5DiffusionEncoder`: matches the canonical ELF implementation's actual use of T5
   (arXiv:2605.10938) -- T5's own frozen token embedding table *is* the space the DLM
@@ -43,7 +52,6 @@ import torch
 import torch.nn as nn
 
 from . import tokenizer as tok
-from .modules import SharedEmbedding
 
 
 def graph_to_text(decoded: dict) -> str:
@@ -95,19 +103,68 @@ def decode_t5_path_text(text: str) -> Optional[list[int]]:
 def decode_t5_path_ids(t5_tokenizer, ids: Sequence[int]) -> Optional[list[int]]:
     """T5-token-id-space analogue of tokenizer.decode_target: parse a (possibly
     model-generated) sequence of T5 subword ids back into a project-vocab node-id path,
-    or None if malformed. Mirrors decode_target's strictness about trailing content:
-    everything after the first </s> must be only <pad>, else this returns None instead
-    of silently ignoring garbage after the intended content."""
+    or None if malformed. Truncates at the first </s> (eos) and ignores everything
+    after it, mirroring decode_target's own relaxation (see that function's docstring):
+    dlm.loss excludes pad positions from both its losses when diffusing in T5's vocab
+    too, so nothing trains the model on what belongs after </s>, and a generation is
+    read by finding it, not by validating its tail."""
     ids = list(ids)
     eos_id = t5_tokenizer.eos_token_id
-    pad_id = t5_tokenizer.pad_token_id
     if eos_id in ids:
-        i = ids.index(eos_id)
-        if any(t != pad_id for t in ids[i + 1:]):
-            return None
-        ids = ids[:i]
+        ids = ids[:ids.index(eos_id)]
     text = t5_tokenizer.decode(ids, skip_special_tokens=False)
     return decode_t5_path_text(text)
+
+
+def compute_l_tgt_t5(t5_tokenizer, margin: int = 8) -> int:
+    """Fixed T5-token-space length for a decoder's fixed-size canvas when generating
+    directly in T5's own vocabulary -- used by both T5DiffusionEncoder (the DLM's
+    diffusion canvas) and T5GraphEncoder (ARLM's `l_tgt_t5`, which adds 1 more for a
+    prepended decoder-start marker, see T5GraphEncoder.tokenize_path_targets). Every
+    batch's target sequence must be padded/truncated to one shared constant, exactly
+    like tokenizer.TARGET_LENGTH is for the project's own vocab.
+
+    Computed from the true worst case rather than scanning the dataset: a path visits
+    at most tok.MAX_NODES distinct nodes (it can't repeat one), so the longest possible
+    path text is path_to_text(<all MAX_NODES node ids>); empirically (see the
+    conversation that added this function) every node-id number contributes exactly
+    one T5 token regardless of digit count, so no other node-id subset or ordering can
+    produce a longer tokenization -- verified against 2000+ random paths, all <= this
+    worst case. `margin` is pure safety headroom against tokenizer quirks not covered
+    by that verification, not a correction to a known gap."""
+    worst_path = list(range(tok.MAX_NODES))
+    ids = t5_tokenizer(path_to_text(worst_path))["input_ids"]
+    return len(ids) + margin
+
+
+class UntiedEmbedding(nn.Module):
+    """An ordinary, independently-trained input-embedding + output-unembedding pair --
+    no weight tying at all, unlike modules.SharedEmbedding (tied embed/unembed, and
+    *shared* -- the literal same object -- into a decoder from whichever encoder
+    pretrained it) or T5TiedEmbedding (tied to T5's own frozen table below). This is
+    what a from-scratch GPT decoder head normally looks like: `nn.Embedding(vocab_size,
+    d_model)` for input, a separate `nn.Linear(d_model, vocab_size)` for output logits.
+    Used by T5GraphEncoder over T5's own vocabulary (`vocab_size = len(t5_tokenizer)`,
+    ARLM+T5 decodes *into* T5's vocab, not the project's own 21-token one -- see that
+    class's docstring), where there is no pretrained embedding space worth tying into --
+    tying was never load-bearing there, just borrowed convention from
+    GraphEncoder/T5DiffusionEncoder, where it actually is."""
+
+    def __init__(self, vocab_size: int = tok.VOCAB_SIZE, d_model: int = 128):
+        super().__init__()
+        self.tok_embedding = nn.Embedding(vocab_size, d_model)
+        nn.init.normal_(self.tok_embedding.weight, mean=0.0, std=0.02)
+        self.lm_head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        return self.tok_embedding(ids)
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.tok_embedding.weight
+
+    def unembed(self, x: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(x)
 
 
 class T5GraphEncoder(nn.Module):
@@ -115,18 +172,29 @@ class T5GraphEncoder(nn.Module):
     differs from T5DiffusionEncoder. Used by train_arlm.py's --encoder_kind t5, and
     available for eval_only.py/eval_venn.py against ARLM+T5 checkpoints.
 
-    T5's own embedding space is pretrained on natural-language subwords and has nothing
-    to do with this project's 22-token graph vocab, so -- unlike GraphEncoder, whose
-    embedding table *is* the pretrained conditioning signal and is shared verbatim into
-    the decoder -- this encoder owns a fresh SharedEmbedding over the graph vocab that
-    trains from scratch alongside the decoder, plus a trainable linear projection from
-    T5's hidden size down to this project's d_model. Only those two pieces are
-    trainable; the T5 stack itself stays frozen throughout.
+    T5's contextualized hidden states are used directly as cross-attention context, with
+    no projection layer -- T5's embedding dimension and hidden-state dimension are the
+    same throughout its stack, so `self.d_model` is always T5's own `config.d_model`
+    (512 for t5-small), not a free choice; `GPTDecoder`'s own d_model must match it
+    exactly for cross-attention's shapes to line up.
+
+    `GPTDecoder` also decodes *into* T5's own vocabulary, not this project's own
+    21-token one: `self.embedding` is an UntiedEmbedding sized to
+    `len(self.t5_tokenizer)` (T5's real, tight vocabulary bound -- see
+    `tokenize_path_targets`'s docstring for why this specific value), so training
+    targets are T5's own tokenization of `path_to_text(path)` rather than
+    `tokenizer.encode_target(path)`. `embedding`'s embed and unembed remain fully
+    untied from each other AND from T5's own (frozen) embedding table -- see
+    UntiedEmbedding's docstring for why tying isn't meaningful here even though the
+    vocabulary now happens to be the same one T5 itself uses. Only `embedding` is
+    trainable; the T5 stack itself stays frozen throughout, and (since nothing else
+    here is trainable either) its forward pass never needs gradient to flow through it
+    at all.
     """
 
-    context_requires_grad = True  # see common.encode_context
+    context_requires_grad = False  # nothing trainable on the T5 side -- see class docstring
 
-    def __init__(self, model_name: str = "t5-small", d_model: int = 128, max_text_len: int = 256):
+    def __init__(self, model_name: str = "t5-small", max_text_len: int = 256):
         super().__init__()
         from transformers import AutoTokenizer, T5EncoderModel
 
@@ -135,16 +203,18 @@ class T5GraphEncoder(nn.Module):
         self.t5_tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.t5 = T5EncoderModel.from_pretrained(model_name)
 
-        self.d_model = d_model
-        self.proj = nn.Linear(self.t5.config.d_model, d_model)
-        self.embedding = SharedEmbedding(vocab_size=tok.VOCAB_SIZE, d_model=d_model)
+        self.d_model = self.t5.config.d_model
+        self.embedding = UntiedEmbedding(vocab_size=len(self.t5_tokenizer), d_model=self.d_model)
+        # +1 beyond compute_l_tgt_t5's own bound for the prepended decoder-start marker
+        # -- see tokenize_path_targets.
+        self.l_tgt_t5 = compute_l_tgt_t5(self.t5_tokenizer) + 1
 
         self.freeze()
 
     def freeze(self) -> None:
-        """Freeze the pretrained T5 stack only; `proj` and `embedding` stay trainable
-        (see class docstring). Kept as an explicit method, mirroring
-        GraphEncoder.freeze(), so load_t5_encoder reads the same as load_frozen_encoder."""
+        """Freeze the pretrained T5 stack only; `embedding` stays trainable (see class
+        docstring). Kept as an explicit method, mirroring GraphEncoder.freeze(), so
+        load_t5_encoder reads the same as load_frozen_encoder."""
         for p in self.t5.parameters():
             p.requires_grad = False
         self.t5.eval()
@@ -152,9 +222,9 @@ class T5GraphEncoder(nn.Module):
     def train(self, mode: bool = True):
         """Override so an accidental `t5_graph_encoder.train()` (e.g. via a parent
         module's recursive .train()) can never put the frozen T5 stack into train mode
-        (dropout etc.) -- proj/embedding still switch normally since they're plain
-        submodules without their own train()/eval() semantics beyond dropout, which
-        neither has."""
+        (dropout etc.) -- `embedding` still switches normally since it's a plain
+        submodule without its own train()/eval() semantics beyond dropout, which it
+        doesn't have."""
         super().train(mode)
         self.t5.eval()
         return self
@@ -163,10 +233,9 @@ class T5GraphEncoder(nn.Module):
         """The only weights this encoder needs checkpointed -- the frozen T5 stack is
         reproducible from `model_name` alone, so re-saving its ~tens-of-millions of
         frozen params on every checkpoint would be pure waste."""
-        return {"proj": self.proj.state_dict(), "embedding": self.embedding.state_dict()}
+        return {"embedding": self.embedding.state_dict()}
 
     def load_trainable_state_dict(self, state: dict) -> None:
-        self.proj.load_state_dict(state["proj"])
         self.embedding.load_state_dict(state["embedding"])
 
     def _texts_from_batch(self, input_ids: torch.Tensor, input_mask: torch.Tensor) -> list[str]:
@@ -185,13 +254,41 @@ class T5GraphEncoder(nn.Module):
         ).to(input_ids.device)
         with torch.no_grad():
             hidden = self.t5(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"]).last_hidden_state
-        context = self.proj(hidden)  # trainable projection -> gradient flows here even though `hidden` came from no_grad
-        context_mask = enc["attention_mask"].bool()
-        return context, context_mask
+        return hidden, enc["attention_mask"].bool()
+
+    def tokenize_path_targets(self, target_ids: torch.Tensor, device) -> torch.Tensor:
+        """Batch of project-vocab target_ids (as stored in PathDataset, decoded via
+        tokenizer.decode_target) -> T5's own tokenization of path_to_text(path), with
+        T5's own `pad_token_id` prepended as a decoder-start marker -- this is what
+        actually gets passed as `target_ids` to arlm.loss, and what arlm.sample's
+        `start_id`/`pad_id` must also be set to (see train_arlm.py). T5 has no
+        dedicated BOS token, so using pad_token_id as the decoder-start marker mirrors
+        the standard T5/seq2seq convention (`decoder_start_token_id = pad_token_id`,
+        e.g. HF's own T5ForConditionalGeneration default) rather than inventing a new
+        one. Padded/truncated to this encoder's fixed `self.l_tgt_t5`; asserts (rather
+        than silently truncating) if a real path's tokenization plus the prepended
+        marker would exceed it."""
+        texts = []
+        for row in target_ids.cpu().tolist():
+            path = tok.decode_target(row)
+            assert path is not None, "ground-truth target should always be well-formed"
+            texts.append(path_to_text(path))
+        pad_id = self.t5_tokenizer.pad_token_id
+        unpadded = self.t5_tokenizer(texts, padding=False, truncation=False)["input_ids"]
+        longest = max(len(ids) for ids in unpadded) + 1  # +1 for the prepended start marker
+        assert longest <= self.l_tgt_t5, (
+            f"a target path's T5 tokenization plus start marker ({longest} tokens) exceeds "
+            f"l_tgt_t5={self.l_tgt_t5} -- compute_l_tgt_t5's margin needs increasing"
+        )
+        enc = self.t5_tokenizer(
+            texts, return_tensors="pt", padding="max_length", max_length=self.l_tgt_t5 - 1, truncation=False,
+        )["input_ids"]
+        start = torch.full((enc.shape[0], 1), pad_id, dtype=torch.long)
+        return torch.cat([start, enc], dim=1).to(device)
 
 
-def load_t5_encoder(model_name: str, d_model: int, device) -> T5GraphEncoder:
-    encoder = T5GraphEncoder(model_name=model_name, d_model=d_model).to(device)
+def load_t5_encoder(model_name: str, device) -> T5GraphEncoder:
+    encoder = T5GraphEncoder(model_name=model_name).to(device)
     encoder.eval()
     return encoder
 
@@ -218,26 +315,6 @@ class T5TiedEmbedding(nn.Module):
 
     def unembed(self, x: torch.Tensor) -> torch.Tensor:
         return x @ self.t5_embedding.weight.t()
-
-
-def compute_l_tgt_t5(t5_tokenizer, margin: int = 8) -> int:
-    """Fixed T5-token-space length for the DLM's diffusion canvas when diffusing
-    directly in T5's embedding space (T5DiffusionEncoder) -- every batch's target
-    sequence must be padded/truncated to one shared constant, exactly like
-    tokenizer.TARGET_LENGTH is for the project's own vocab, since the DLM's positional
-    encoding and fixed-size diffusion tensors assume one constant shape.
-
-    Computed from the true worst case rather than scanning the dataset: a path visits
-    at most tok.MAX_NODES distinct nodes (it can't repeat one), so the longest possible
-    path text is path_to_text(<all MAX_NODES node ids>); empirically (see the
-    conversation that added this function) every node-id number contributes exactly
-    one T5 token regardless of digit count, so no other node-id subset or ordering can
-    produce a longer tokenization -- verified against 2000+ random paths, all <= this
-    worst case. `margin` is pure safety headroom against tokenizer quirks not covered
-    by that verification, not a correction to a known gap."""
-    worst_path = list(range(tok.MAX_NODES))
-    ids = t5_tokenizer(path_to_text(worst_path))["input_ids"]
-    return len(ids) + margin
 
 
 class T5DiffusionEncoder(nn.Module):
@@ -350,22 +427,31 @@ def load_t5_diffusion_encoder(model_name: str, device, l_tgt_t5: Optional[int] =
     return encoder
 
 
-class T5SpaceDLMAdapter:
-    """Wraps a DLMDecoder that was trained to diffuse/generate in T5's own token-id
-    space (see T5DiffusionEncoder) so it exposes the same
-    `.generate(context, context_mask, **kwargs) -> LongTensor[B, tokenizer.TARGET_LENGTH]`
-    interface, in the project's own 21-token vocab, that every other decoder in this
-    codebase exposes -- this is what lets metrics.run_eval and viz.plot_example stay
-    completely unaware T5 was ever involved, rather than needing a parallel T5-aware
-    scoring/plotting path. A generation this can't parse back into a well-formed path
-    (decode_t5_path_ids returns None, or the path doesn't fit tokenizer.TARGET_LENGTH)
-    re-encodes to an all-<PAD> row, which tokenizer.decode_target already treats as
-    invalid (its first required token is <P>), so it flows through exactly like any
-    other malformed generation everywhere downstream."""
+class T5SpaceDecoderAdapter:
+    """Wraps a decoder (DLMDecoder or GPTDecoder) that generates in T5's own token-id
+    space (T5DiffusionEncoder for the DLM, T5GraphEncoder for the ARLM) so it exposes
+    the same `.generate(context, context_mask, **kwargs) -> LongTensor[B,
+    tokenizer.TARGET_LENGTH]` interface, in the project's own 21-token vocab, that every
+    other decoder in this codebase exposes -- this is what lets metrics.run_eval and
+    viz.plot_example stay completely unaware T5 was ever involved, rather than needing a
+    parallel T5-aware scoring/plotting path. A generation this can't parse back into a
+    well-formed path (decode_t5_path_ids returns None, or the path doesn't fit
+    tokenizer.TARGET_LENGTH) re-encodes to an all-<PAD> row, which
+    tokenizer.decode_target already treats as invalid (its first required token is
+    <P>), so it flows through exactly like any other malformed generation everywhere
+    downstream.
 
-    def __init__(self, model, t5_tokenizer):
+    `drop_first_token`: set True for the ARLM (only) -- arlm.sample always writes a
+    fixed decoder-start marker (T5's pad_token_id, see T5GraphEncoder.tokenize_path_targets)
+    into position 0 of every generation, which isn't part of the actual path text and
+    must be stripped before decode_t5_path_ids tries to parse it (otherwise the decoded
+    text starts with a literal "<pad>" and never matches the "Path : ..." template). The
+    DLM has no such marker -- its raw generation starts directly with content."""
+
+    def __init__(self, model, t5_tokenizer, drop_first_token: bool = False):
         self.model = model
         self.t5_tokenizer = t5_tokenizer
+        self.drop_first_token = drop_first_token
 
     def eval(self):
         self.model.eval()
@@ -381,6 +467,8 @@ class T5SpaceDLMAdapter:
         device = raw.device
         out = torch.zeros(raw.shape[0], tok.TARGET_LENGTH, dtype=torch.long, device=device)  # all-<PAD> default
         for i, row in enumerate(raw.tolist()):
+            if self.drop_first_token:
+                row = row[1:]
             path = decode_t5_path_ids(self.t5_tokenizer, row)
             if path is None or any(not (0 <= n < tok.MAX_NODES) for n in path):
                 continue  # leave as all-<PAD> -> tok.decode_target(...) treats it as invalid
