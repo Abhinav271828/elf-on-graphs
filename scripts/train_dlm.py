@@ -50,6 +50,23 @@ def main():
     p.add_argument("--warmup_steps", type=int, default=2000)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--optimizer", type=str, default="muon", choices=["adamw", "muon"],
+                    help="'muon' (default) matches the canonical ELF implementation "
+                         "(arXiv:2605.10938, Section 4): Muon over the decoder's own "
+                         ">=2D hidden weight matrices, AdamW (--lr/--weight_decay above) "
+                         "over embeddings/norms/biases/null_context -- see "
+                         "common.build_dlm_optimizer. 'adamw' uses a single AdamW "
+                         "optimizer over everything, as in train_arlm.py/pretrain_encoder.py.")
+    p.add_argument("--muon_lr", type=float, default=0.02,
+                    help="peak LR for the Muon param group; only used when --optimizer muon. "
+                         "The ELF paper reports 0.002 -- pass that explicitly to match it; "
+                         "this default instead follows Muon's own more common convention "
+                         "(Jordan et al.), an order of magnitude above typical AdamW LRs.")
+    p.add_argument("--muon_momentum", type=float, default=0.95,
+                    help="only used when --optimizer muon.")
+    p.add_argument("--muon_weight_decay", type=float, default=0.0,
+                    help="only used when --optimizer muon; decoupled weight decay on the "
+                         "Muon param group, applied separately from --weight_decay.")
     p.add_argument("--patience", type=int, default=5)
     p.add_argument("--tolerance", type=float, default=0.005)
     p.add_argument("--cfg_dropout", type=float, default=0.1)
@@ -115,8 +132,15 @@ def main():
     n_id_batches = math.ceil(args.n_id_subsample / args.batch_size)
     n_ood_batches = math.ceil(args.n_ood_subsample / args.batch_size)
 
-    optimizer = common.build_optimizer([model, encoder], lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = common.build_lr_schedule(optimizer, warmup_steps=args.warmup_steps, total_steps=args.max_steps)
+    if args.optimizer == "muon":
+        optimizer = common.build_dlm_optimizer(
+            [model, encoder], adamw_lr=args.lr, adamw_weight_decay=args.weight_decay,
+            muon_lr=args.muon_lr, muon_momentum=args.muon_momentum, muon_weight_decay=args.muon_weight_decay,
+        )
+        scheduler = common.build_multi_lr_schedule(optimizer, warmup_steps=args.warmup_steps, total_steps=args.max_steps)
+    else:
+        optimizer = common.build_optimizer([model, encoder], lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = common.build_lr_schedule(optimizer, warmup_steps=args.warmup_steps, total_steps=args.max_steps)
     early_stopper = common.EarlyStopper(tolerance=args.tolerance, patience=args.patience, mode="max")
     sample_kwargs = {"num_steps": args.num_sample_steps, "guidance_scale": args.guidance_scale,
                       "use_self_cond": args.selfcond_prob > 0}
@@ -127,7 +151,7 @@ def main():
     resumed_wandb_run_id = None
     ckpt_path = common.resolve_checkpoint_path(args.run_dir, args.resume)
     if ckpt_path is not None:
-        common.check_checkpoint_config(ckpt_path, {"encoder_kind": args.encoder_kind})
+        common.check_checkpoint_config(ckpt_path, {"encoder_kind": args.encoder_kind, "optimizer": args.optimizer})
         state = common.load_checkpoint(ckpt_path, model, optimizer, scheduler, map_location=device)
         start_step = state["step"] + 1
         if "early_stopper" in state["extra_state"]:
@@ -193,10 +217,18 @@ def main():
 
         if step % args.log_every == 0:
             elapsed = time.time() - t0
+            log_dict = {"train/loss": out["loss"].item(), "train/denoise_loss": out["denoise_loss"].item(),
+                        "train/decode_loss": out["decode_loss"].item()}
+            if args.optimizer == "muon":
+                lrs = scheduler.get_last_lr()  # {"muon": [...], "adamw": [...]}
+                lr_str = " ".join(f"lr_{name}={vals[0]:.2e}" for name, vals in lrs.items())
+                log_dict.update({f"train/lr_{name}": vals[0] for name, vals in lrs.items()})
+            else:
+                lr_str = f"lr {scheduler.get_last_lr()[0]:.2e}"
+                log_dict["train/lr"] = scheduler.get_last_lr()[0]
             print(f"step {step} loss {out['loss'].item():.4f} denoise {out['denoise_loss'].item():.4f} "
-                  f"decode {out['decode_loss'].item():.4f} lr {scheduler.get_last_lr()[0]:.2e} ({elapsed:.1f}s)")
-            run.log({"train/loss": out["loss"].item(), "train/denoise_loss": out["denoise_loss"].item(),
-                      "train/decode_loss": out["decode_loss"].item(), "train/lr": scheduler.get_last_lr()[0]}, step=step)
+                  f"decode {out['decode_loss'].item():.4f} {lr_str} ({elapsed:.1f}s)")
+            run.log(log_dict, step=step)
 
         do_full = (step % args.full_eval_every == 0) or (step == args.max_steps - 1)
         do_cheap = (step % args.eval_every == 0) or do_full or (step == args.max_steps - 1)

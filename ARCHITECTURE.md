@@ -50,6 +50,7 @@ depends on a completed encoder checkpoint, because both `train_dlm.py` and
 | [`src/spelf/t5_encoder.py`](src/spelf/t5_encoder.py) | Optional alternative conditioning encoder: frozen pretrained HuggingFace T5 over a text serialization of the graph. |
 | [`src/spelf/dlm.py`](src/spelf/dlm.py) | `DLMDecoder` — ELF-style rectified-flow diffusion decoder (loss + Euler sampler). |
 | [`src/spelf/arlm.py`](src/spelf/arlm.py) | `GPTDecoder` — causal autoregressive decoder (loss + greedy sampler). |
+| [`src/spelf/muon.py`](src/spelf/muon.py) | `Muon` optimizer — the canonical ELF implementation's optimizer for the DLM's own hidden weight matrices (verified against arXiv:2605.10938 directly; see §6.8). |
 | [`src/spelf/metrics.py`](src/spelf/metrics.py) | Decodes raw generations and scores token-accuracy / exact-match / valid / shortest / correct-length / optimal rates. Model-agnostic. |
 | [`src/spelf/viz.py`](src/spelf/viz.py) | Ground-truth-vs-generated two-panel graph plots, for wandb image logging. |
 | [`src/spelf/common.py`](src/spelf/common.py) | Seeding, device selection, optimizer/LR-schedule construction, checkpoint save/load/resume, early stopping, wandb init, uniform `(context, context_mask)` dispatch across encoder backends. |
@@ -439,6 +440,47 @@ decode past their own `<EOS>`), or at `max_len` (defaults to `l_tgt`). No KV-cac
 full forward pass is recomputed every step; explicitly noted as negligible cost at this
 scale (2 layers, `d_model=128`, `L_TGT<=16`).
 
+### 6.8 DLM optimizer: Muon + AdamW hybrid
+
+`train_dlm.py --optimizer muon` (the default) matches the canonical ELF implementation,
+which was checked directly against the paper (arXiv:2605.10938, Section 4: "Muon
+optimizer with learning rate 0.002") before wiring this in — see §11's note on which
+details the paper does and doesn't specify. `src/spelf/muon.py` implements Muon itself
+(`_newton_schulz5`: a fixed quintic Newton-Schulz iteration that approximately
+orthogonalizes a matrix in ~5 steps, run in bfloat16 for speed; `Muon`: Nesterov momentum
+→ orthogonalize the momentum-adjusted update → rescale by `max(1, rows/cols)**0.5` →
+decoupled weight decay). Muon's own usage convention (not specific to this codebase) is
+that it should only optimize a transformer's own ≥2D "hidden" weight matrices —
+embeddings, positional/mode embeddings, and any 1D parameter (biases, LayerNorm
+weight/bias) are conventionally left to AdamW instead, since Muon's orthogonalized-update
+semantics assume the parameter is a linear map between two continuous spaces, which
+doesn't fit an embedding table's per-row lookup semantics.
+
+`common._is_muon_eligible(name, p)` implements that split for this codebase's specific
+parameter names: `p.ndim < 2` → AdamW; name containing `"embedding"`, `"pos_emb"`,
+`"mode_emb"`, or `"null_context"` → AdamW (this is what excludes `SharedEmbedding`,
+`LearnedPosEnc.pos_emb`, `DLMDecoder.mode_emb`, and `DLMDecoder.null_context` — the last
+of these has `ndim=3`, shape `(1,1,d_model)`, so it isn't caught by the `ndim<2` rule
+alone and needs the explicit name exclusion); everything else (attention in/out
+projections, MLP linears, `DLMDecoder`'s own `input_proj`/`out_proj`) → Muon.
+`common.build_dlm_optimizer` applies this split via `trainable_parameters` (so a
+parameter shared across modules, e.g. the embedding table shared between encoder and
+decoder, is never double-assigned) and returns a `common.MultiOptimizer` wrapping both
+underlying optimizers — a small class that duck-types `torch.optim.Optimizer`'s
+`step`/`zero_grad`/`state_dict`/`load_state_dict` interface closely enough to drop into
+`save_checkpoint`/`load_checkpoint` completely unchanged. `common.build_multi_lr_schedule`
+does the same for a matching pair of `LambdaLR`s (`common.MultiScheduler`), both sharing
+the same warmup/cosine shape but each keyed to its own optimizer's own peak LR
+(`--muon_lr`, default 0.02 — an order of magnitude above typical AdamW LRs, matching
+Muon's own literature convention — vs. `--lr`, default 2e-4, for the AdamW group).
+
+`--optimizer adamw` is kept as an explicit fallback/ablation path — a single AdamW
+optimizer over every trainable DLM parameter, identical in shape to what
+`train_arlm.py`/`pretrain_encoder.py` already do (`common.build_optimizer`, untouched by
+this addition). Grad-clipping (`torch.nn.utils.clip_grad_norm_`) is unaffected by either
+choice — it already operates over the raw trainable-parameter list, independent of which
+optimizer(s) will consume the clipped gradients.
+
 ## 7. Evaluation semantics
 
 Source: [`metrics.py`](src/spelf/metrics.py).
@@ -635,6 +677,15 @@ name, its default may differ between them (noted inline).
 | `--patience` | 5 | Consecutive non-improving eval rounds tolerated before stopping. |
 | `--tolerance` | 0.005 | Minimum ID `optimal_rate` improvement to reset the patience counter. |
 
+### DLM optimizer (`train_dlm.py` only, §6.8)
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--optimizer` | `muon` | `muon` = canonical-ELF-matching Muon+AdamW hybrid; `adamw` = single AdamW optimizer over everything (same shape as `train_arlm.py`/`pretrain_encoder.py`). |
+| `--muon_lr` | 0.02 | Peak LR for the Muon param group (only used when `--optimizer muon`); the paper reports 0.002 — pass that explicitly to match it exactly. |
+| `--muon_momentum` | 0.95 | Muon's Nesterov momentum coefficient. |
+| `--muon_weight_decay` | 0.0 | Decoupled weight decay on the Muon param group, independent of `--weight_decay` (which still governs the AdamW group in both `--optimizer` modes). |
+
 ### DLM-specific (`train_dlm.py`, plus a read-only echo in `eval_only.py`/`eval_venn.py` via the checkpoint's saved config)
 
 | Flag | Default | Effect |
@@ -732,6 +783,11 @@ single `torch.save`d dict:
   "step": int,
   "model_state": <model.state_dict()>,
   "optimizer_state": <optimizer.state_dict() or None>,
+      # for DLM checkpoints with --optimizer muon (the default): {"muon": ..., "adamw": ...}
+      # (common.MultiOptimizer.state_dict(), see §6.8) rather than a single optimizer's
+      # state dict -- MultiOptimizer/MultiScheduler duck-type enough of
+      # torch.optim.Optimizer's interface that save_checkpoint/load_checkpoint don't
+      # need to know the difference.
   "scheduler_state": <scheduler.state_dict() or None>,
   "extra_state": {
       # encoder: {"best_eval_loss": float | None, "wandb_run_id": str}
@@ -770,5 +826,16 @@ project's original plan):
   pool (not just `0..n-1`), `label_pool_size < n` is rejected, default (no pool) behavior
   is unchanged, and ID-sized training graphs really do exercise high node-id tokens
   (directly exercises `assert_full_node_id_coverage`).
+- `test_muon.py` — the Muon optimizer and its DLM-specific parameter split (§6.8):
+  `_newton_schulz5` meaningfully orthogonalizes relative to the untouched raw input
+  (not a monotonic-in-steps check — verified empirically that this particular
+  fixed-coefficient bf16 iteration plateaus/oscillates past ~2 steps rather than
+  continuing to converge); `Muon` rejects 1D parameters at construction and reduces
+  loss on a toy regression; `common._is_muon_eligible`'s exact routing rules (a real
+  hidden weight matrix in, every embedding/`null_context` out); `common.build_dlm_optimizer`
+  partitions a real (tiny) `DLMDecoder`+`GraphEncoder`'s trainable parameters with no
+  double-assignment and no missing parameter; `MultiOptimizer`/`MultiScheduler`
+  state-dict round-tripping and shared warmup/cosine shape across both underlying
+  optimizers.
 
 Run with `pytest tests/ -q` from the repo root (after `pip install -r requirements.txt`).

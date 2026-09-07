@@ -13,6 +13,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from .muon import Muon
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -73,6 +75,92 @@ def build_optimizer(modules: torch.nn.Module | list[torch.nn.Module], lr: float,
     return torch.optim.AdamW(groups, lr=lr)
 
 
+def _is_muon_eligible(name: str, p: torch.nn.Parameter) -> bool:
+    """True for a transformer's own >=2D "hidden" weight matrices -- the only
+    parameters Muon (muon.py) is designed to optimize. Everything else is routed to a
+    conventional AdamW group instead: any 1D parameter (biases, LayerNorm weight/bias),
+    any embedding table (`SharedEmbedding`'s tied token embedding, `LearnedPosEnc`'s
+    positional embedding, the DLM's per-branch `mode_emb`), and the DLM's
+    `null_context` vector (shape (1,1,d_model) -- a single learned bias-like vector,
+    not a weight matrix, even though its ndim happens to be >=2)."""
+    if p.ndim < 2:
+        return False
+    lname = name.lower()
+    if "embedding" in lname or "pos_emb" in lname or "mode_emb" in lname or "null_context" in lname:
+        return False
+    return True
+
+
+class MultiOptimizer:
+    """Duck-types just enough of torch.optim.Optimizer's interface (step, zero_grad,
+    state_dict, load_state_dict) to drop into save_checkpoint/load_checkpoint
+    unchanged, while actually driving more than one underlying optimizer -- e.g. Muon
+    over a DLM's hidden weight matrices plus AdamW over everything else, see
+    build_dlm_optimizer -- as a single unit."""
+
+    def __init__(self, optimizers: dict[str, torch.optim.Optimizer]):
+        self.optimizers = optimizers
+
+    def step(self, closure=None) -> None:
+        for opt in self.optimizers.values():
+            opt.step()
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        for opt in self.optimizers.values():
+            opt.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self) -> dict:
+        return {name: opt.state_dict() for name, opt in self.optimizers.items()}
+
+    def load_state_dict(self, state: dict) -> None:
+        for name, opt in self.optimizers.items():
+            opt.load_state_dict(state[name])
+
+
+def build_dlm_optimizer(
+    modules: torch.nn.Module | list[torch.nn.Module],
+    adamw_lr: float,
+    adamw_weight_decay: float = 0.01,
+    muon_lr: float = 0.02,
+    muon_momentum: float = 0.95,
+    muon_weight_decay: float = 0.0,
+) -> MultiOptimizer:
+    """DLM-only optimizer construction matching the canonical ELF implementation
+    (arXiv:2605.10938, Section 4): Muon over the decoder's (and, if --encoder_kind t5,
+    the T5 projection's) own >=2D hidden weight matrices, AdamW over everything else --
+    embeddings, positional/mode embeddings, null_context, LayerNorm, biases -- see
+    _is_muon_eligible for the exact split and build_optimizer's docstring for why
+    embeddings/norms/biases are excluded from AdamW weight decay too. Returns a
+    MultiOptimizer wrapping both underlying optimizers.
+
+    Deduplicates by parameter identity via trainable_parameters, same as
+    build_optimizer, so a parameter shared across modules (e.g. the embedding table,
+    shared between encoder and decoder) is never assigned to two groups.
+
+    pretrain_encoder.py and train_arlm.py are untouched by this function -- they
+    still call the plain AdamW-only build_optimizer above; only train_dlm.py's
+    --optimizer muon path (the default) uses this."""
+    muon_params, adamw_decay, adamw_no_decay = [], [], []
+    for name, p in trainable_parameters(modules):
+        if _is_muon_eligible(name, p):
+            muon_params.append(p)
+        elif p.ndim <= 1 or "embedding" in name.lower() or "norm" in name.lower() or "null_context" in name.lower():
+            adamw_no_decay.append(p)
+        else:
+            adamw_decay.append(p)
+
+    optimizers: dict[str, torch.optim.Optimizer] = {}
+    if muon_params:
+        optimizers["muon"] = Muon(muon_params, lr=muon_lr, momentum=muon_momentum,
+                                   weight_decay=muon_weight_decay)
+    adamw_groups = [
+        {"params": adamw_decay, "weight_decay": adamw_weight_decay},
+        {"params": adamw_no_decay, "weight_decay": 0.0},
+    ]
+    optimizers["adamw"] = torch.optim.AdamW(adamw_groups, lr=adamw_lr)
+    return MultiOptimizer(optimizers)
+
+
 def encode_context(encoder: torch.nn.Module, input_ids: torch.Tensor,
                     input_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Uniform (context, context_mask) call across conditioning-encoder backends.
@@ -107,6 +195,38 @@ def build_lr_schedule(optimizer: torch.optim.Optimizer, warmup_steps: int, total
         progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
         return 0.5 * (1 + math.cos(math.pi * progress))
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+class MultiScheduler:
+    """Same duck-typing idea as MultiOptimizer (step, state_dict, load_state_dict,
+    get_last_lr), for a matching set of per-optimizer LR schedulers -- see
+    build_multi_lr_schedule."""
+
+    def __init__(self, schedulers: dict[str, torch.optim.lr_scheduler.LRScheduler]):
+        self.schedulers = schedulers
+
+    def step(self) -> None:
+        for s in self.schedulers.values():
+            s.step()
+
+    def state_dict(self) -> dict:
+        return {name: s.state_dict() for name, s in self.schedulers.items()}
+
+    def load_state_dict(self, state: dict) -> None:
+        for name, s in self.schedulers.items():
+            s.load_state_dict(state[name])
+
+    def get_last_lr(self) -> dict[str, list[float]]:
+        return {name: s.get_last_lr() for name, s in self.schedulers.items()}
+
+
+def build_multi_lr_schedule(optimizer: MultiOptimizer, warmup_steps: int, total_steps: int) -> MultiScheduler:
+    """One independent linear-warmup -> cosine-decay LambdaLR per underlying optimizer
+    in `optimizer` (see build_dlm_optimizer) -- same warmup/total-step shape for both,
+    each keyed to its own optimizer's own peak lr (Muon's lr is typically an order of
+    magnitude higher than AdamW's, see train_dlm.py's --muon_lr default)."""
+    return MultiScheduler({name: build_lr_schedule(opt, warmup_steps, total_steps)
+                            for name, opt in optimizer.optimizers.items()})
 
 
 class EarlyStopper:
@@ -178,7 +298,7 @@ def save_checkpoint(
     run_dir: str | Path,
     step: int,
     model: torch.nn.Module,
-    optimizer: Optional[torch.optim.Optimizer],
+    optimizer: "Optional[torch.optim.Optimizer | MultiOptimizer]",
     scheduler=None,
     extra_state: Optional[dict] = None,
     config: Optional[dict] = None,
@@ -245,7 +365,7 @@ def resolve_checkpoint_path(run_dir: str | Path, resume: Optional[str]) -> Optio
 def load_checkpoint(
     path: str | Path,
     model: torch.nn.Module,
-    optimizer: Optional[torch.optim.Optimizer] = None,
+    optimizer: "Optional[torch.optim.Optimizer | MultiOptimizer]" = None,
     scheduler=None,
     map_location: str | torch.device = "cpu",
     restore_rng: bool = True,

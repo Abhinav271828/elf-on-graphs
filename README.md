@@ -40,6 +40,7 @@ shortest-path/
     encoder.py                  GraphEncoder + its MLM pretraining objective
     dlm.py                      ELF-style diffusion decoder (train loss + sampler)
     arlm.py                     GPT-style causal decoder (train loss + sampler)
+    muon.py                     Muon optimizer (canonical ELF's DLM optimizer)
     metrics.py                  decode generations -> exact-match/valid/optimal rates
     viz.py                      ground-truth-vs-generated graph plots for wandb
     common.py                   seeding, optimizer/LR schedule, checkpoint save/resume,
@@ -262,8 +263,18 @@ RNG state — python/numpy/torch/mps — are all restored).
 ```
 --data_dir data  --encoder_ckpt runs/encoder/checkpoint_best.pt   # required
 --run_dir runs/dlm  --resume latest
---seed 0  --max_steps 150000  --batch_size 128  --lr 2e-4  --warmup_steps 2000
---weight_decay 0.01  --grad_clip 1.0
+--seed 0  --max_steps 150000  --batch_size 128  --warmup_steps 2000  --grad_clip 1.0
+--optimizer muon                                      # 'muon' (default) | 'adamw'; matches the
+                                                       # canonical ELF implementation
+                                                       # (arXiv:2605.10938): Muon over the decoder's
+                                                       # own >=2D hidden weight matrices, AdamW
+                                                       # (--lr/--weight_decay) over everything else
+                                                       # (embeddings/norms/biases/null_context)
+--lr 2e-4  --weight_decay 0.01                        # AdamW group, both optimizer choices
+--muon_lr 0.02  --muon_momentum 0.95  --muon_weight_decay 0.0
+                                                       # Muon group; only used when --optimizer muon.
+                                                       # The paper reports muon_lr=0.002 -- pass that
+                                                       # explicitly to match it exactly
 --patience 5  --tolerance 0.005                      # early stopping on ID optimal-rate
 --cfg_dropout 0.1  --decode_branch_prob 0.2  --selfcond_prob 0.0  --lambda_ce 1.0
                                                        # selfcond_prob=0 (default) is vanilla: no
