@@ -1,0 +1,8 @@
+torch>=2.2
+networkx>=3.2
+matplotlib>=3.8
+numpy>=1.26
+wandb>=0.16
+pytest>=8.0
+transformers>=4.40  # only needed for --encoder_kind t5 (T5GraphEncoder)
+sentencepiece>=0.2  # T5's tokenizer backend
