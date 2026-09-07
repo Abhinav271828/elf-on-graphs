@@ -1,0 +1,37 @@
+# Default configuration. Every field here has the same default in
+# spelf/common.py::Config -- this file exists as an editable template and to
+# document the knobs most worth tuning first. See ARCHITECTURE.md for the
+# reasoning behind each block.
+#
+# Typical local run:
+#   python scripts/generate_data.py   --config configs/default.yml
+#   python scripts/prepare_encoder.py --config configs/default.yml
+#   python scripts/train.py           --config configs/default.yml
+
+# --- Graphs (Erdos-Renyi) ---
+id_min_nodes: 6
+id_max_nodes: 10
+ood_min_nodes: 11
+ood_max_nodes: 14
+n_train: 20000
+n_id_val: 500
+n_ood_test: 500
+data_dir: ./data
+
+# --- Encoder (real pretrained T5, frozen) ---
+encoder_model_name: t5-small
+encoder_profile_path: ./runs/t5_profile.json
+
+# --- Model ---
+model: ELF-XS
+
+# --- Training ---
+epochs: 60
+batch_size: 128
+optimizer: muon
+blr: 0.001
+
+# --- Output / wandb ---
+output_dir: ./runs/dlm
+use_wandb: true
+wandb_project: spelf-diametric-path

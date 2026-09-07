@@ -1,162 +1,228 @@
-"""Shared building blocks used by GraphEncoder, DLMDecoder, and GPTDecoder.
+"""ELF transformer layer primitives.
 
-Convention: masks follow the tokenizer's convention (True = real content, False = PAD)
-everywhere in this codebase's public signatures. `nn.MultiheadAttention` wants the
-opposite (`key_padding_mask`: True = ignore), so the inversion happens right at the
-attention call, not in caller code.
+Ported from ELF's `pytorch_elf` branch (`src/modules/layers.py`) with one
+change: `einops` is dropped in favor of plain `torch.reshape`/`unbind`, since
+the two operations it's used for (RoPE's `rotate_half`, and doubling the
+rotary frequency table) are each a one-liner without it. Everything else --
+RMSNorm, QK-normed multi-head attention with RoPE, SwiGLU FFN, the
+timestep embedder, the bottleneck text projection, and the zero-initialized
+final layer -- matches the reference exactly.
 """
+
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from . import tokenizer as tok
+
+def DEFAULT_KERNEL_INIT(weight: torch.Tensor) -> None:
+    nn.init.xavier_uniform_(weight)
 
 
-class SharedEmbedding(nn.Module):
-    """Token embedding table shared, by checkpoint (not object identity), across the
-    graph encoder, DLM, and ARLM. The encoder pretrains it; downstream DLM/ARLM
-    training loads that checkpoint and calls `freeze_pretrained_rows()`, which installs
-    a gradient hook zeroing gradients for every row except `<P>`/`<EOS>` -- those two
-    tokens never appear in the encoder's own input, so they're left trainable. Combine
-    with zero weight-decay on this parameter (see common.build_optimizer) so frozen
-    rows are truly static, not just gradient-free (AdamW would otherwise still shrink
-    them via weight decay)."""
+def DEFAULT_BIAS_INIT(bias: torch.Tensor) -> None:
+    nn.init.zeros_(bias)
 
-    def __init__(self, vocab_size: int = tok.VOCAB_SIZE, d_model: int = 128):
+
+def ZERO_INIT(t: torch.Tensor) -> None:
+    nn.init.zeros_(t)
+
+
+def NORMAL_INIT_002(t: torch.Tensor) -> None:
+    nn.init.normal_(t, mean=0.0, std=0.02)
+
+
+def _make_linear(in_features: int, out_features: int, bias: bool = True,
+                  kernel_init=DEFAULT_KERNEL_INIT, bias_init=DEFAULT_BIAS_INIT) -> nn.Linear:
+    layer = nn.Linear(in_features, out_features, bias=bias)
+    kernel_init(layer.weight)
+    if bias and bias_init is not None:
+        bias_init(layer.bias)
+    return layer
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate adjacent-pair halves: (..., 2i, 2i+1) -> (..., -x[2i+1], x[2i])."""
+    *prefix, d = x.shape
+    x = x.reshape(*prefix, d // 2, 2)
+    x1, x2 = x.unbind(dim=-1)
+    x = torch.stack((-x2, x1), dim=-1)
+    return x.reshape(*prefix, d)
+
+
+class TextRotaryEmbeddingFast(nn.Module):
+    """1D Rotary Position Embedding, with `num_empty_token` leading positions
+    left unrotated (cos=1, sin=0) -- used for the learned prefix tokens
+    (time / self-cond-cfg / model-mode) that carry no sequence position.
+    """
+
+    def __init__(self, dim: int, pt_seq_len: int = 512,
+                 ft_seq_len: Optional[int] = None, theta: float = 10000.0,
+                 num_empty_token: int = 0):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        # Default nn.Embedding init is N(0,1) per element, so a 128-dim row has norm
-        # ~sqrt(128); dotting two such rows in `unembed` gives huge, poorly-calibrated
-        # logits. Use the conventional small-std init (as in BERT/GPT-2) instead.
-        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
-        self._freeze_hook_handle = None
+        self.dim = dim
+        self.pt_seq_len = pt_seq_len
+        self.ft_seq_len = ft_seq_len if ft_seq_len is not None else pt_seq_len
+        self.theta = theta
+        self.num_empty_token = num_empty_token
+        freqs_cos, freqs_sin = self._compute_freqs()
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        return self.embedding(ids)
+    def _compute_freqs(self):
+        dim, ft_seq_len, pt_seq_len = self.dim, self.ft_seq_len, self.pt_seq_len
+        freqs = 1.0 / (self.theta ** (torch.arange(0, dim, 2, dtype=torch.float32)[: dim // 2] / dim))
+        pos = torch.arange(ft_seq_len, dtype=torch.float32) / ft_seq_len * pt_seq_len
 
-    @property
-    def weight(self) -> torch.Tensor:
-        return self.embedding.weight
+        freqs_main = torch.einsum("i,f->if", pos, freqs)
+        freqs_main = torch.repeat_interleave(freqs_main, repeats=2, dim=-1)
 
-    def unembed(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [..., d_model] -> logits [..., vocab_size], tied to the embedding table."""
-        return x @ self.embedding.weight.t()
+        D = freqs_main.shape[-1]
+        cos_parts, sin_parts = [], []
+        if self.num_empty_token > 0:
+            cos_parts.append(torch.ones((self.num_empty_token, D), dtype=freqs.dtype))
+            sin_parts.append(torch.zeros((self.num_empty_token, D), dtype=freqs.dtype))
+        cos_parts.append(torch.cos(freqs_main))
+        sin_parts.append(torch.sin(freqs_main))
 
-    def freeze_pretrained_rows(self, trainable_token_ids=(tok.P, tok.EOS)) -> None:
-        if self._freeze_hook_handle is not None:
-            self._freeze_hook_handle.remove()
-        vocab_size = self.embedding.weight.shape[0]
-        frozen_mask = torch.ones(vocab_size, dtype=torch.bool)
-        frozen_mask[list(trainable_token_ids)] = False
-
-        def hook(grad: torch.Tensor) -> torch.Tensor:
-            grad = grad.clone()
-            grad[frozen_mask.to(grad.device)] = 0
-            return grad
-
-        self._freeze_hook_handle = self.embedding.weight.register_hook(hook)
-
-
-class LearnedPosEnc(nn.Module):
-    def __init__(self, max_len: int, d_model: int = 128):
-        super().__init__()
-        self.pos_emb = nn.Embedding(max_len, d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, L, D]
-        length = x.shape[1]
-        positions = torch.arange(length, device=x.device)
-        return x + self.pos_emb(positions)[None, :, :]
-
-
-class TimeEmbedding(nn.Module):
-    """Sinusoidal features of scalar diffusion time t in [0,1] -> MLP, standard
-    diffusion-timestep embedding."""
-
-    def __init__(self, d_model: int = 128, n_freq: int = 64):
-        super().__init__()
-        self.n_freq = n_freq
-        self.mlp = nn.Sequential(
-            nn.Linear(2 * n_freq, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
-        )
+        freqs_cos = torch.cat(cos_parts, dim=0) if len(cos_parts) > 1 else cos_parts[0]
+        freqs_sin = torch.cat(sin_parts, dim=0) if len(sin_parts) > 1 else sin_parts[0]
+        return freqs_cos, freqs_sin
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        # t: [B]
-        device = t.device
-        freqs = torch.exp(torch.linspace(0, math.log(10000.0), self.n_freq, device=device))
-        args = t[:, None] * freqs[None, :]  # [B, n_freq]
-        feats = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-        return self.mlp(feats)
+        freqs_cos = self.freqs_cos.to(t.dtype)
+        freqs_sin = self.freqs_sin.to(t.dtype)
+        return t * freqs_cos + rotate_half(t) * freqs_sin
 
 
-class EncoderLayer(nn.Module):
-    """Pre-LN bidirectional self-attention block (no causal mask, no cross-attention)."""
-
-    def __init__(self, d_model: int = 128, n_heads: int = 8, d_mlp: int = 512, dropout: float = 0.1):
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        # dropout=0 here: nn.MultiheadAttention's SDPA fast path doesn't support
-        # dropout_p>0 during training on MPS (NotImplementedError). Regularization
-        # still comes from the post-attention/MLP `self.dropout` below.
-        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=0.0, batch_first=True)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, d_mlp), nn.GELU(), nn.Linear(d_mlp, d_model)
-        )
-        self.dropout = nn.Dropout(dropout)
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    def forward(self, x: torch.Tensor, input_mask: torch.Tensor | None = None) -> torch.Tensor:
-        # input_mask: [B, L], True = real token (tokenizer convention)
-        kpm = ~input_mask if input_mask is not None else None
-        h = self.ln1(x)
-        attn_out, _ = self.self_attn(h, h, h, key_padding_mask=kpm, need_weights=False)
-        x = x + self.dropout(attn_out)
-        h = self.ln2(x)
-        x = x + self.dropout(self.mlp(h))
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        variance = hidden_states.float().pow(2).mean(dim=-1, keepdim=True)
+        inv_std = torch.rsqrt(variance + self.eps).to(input_dtype)
+        return self.weight.to(input_dtype) * (hidden_states * inv_std)
+
+
+class BottleneckTextProj(nn.Module):
+    """Projects the frozen encoder's hidden dim into the ELF backbone's
+    hidden dim through a low-rank bottleneck (regularizes the conditioning
+    signal and keeps the projection cheap)."""
+
+    def __init__(self, text_encoder_dim: int, hidden_size: int, bottleneck_dim: int):
+        super().__init__()
+        self.proj1 = _make_linear(text_encoder_dim, bottleneck_dim, bias=False)
+        self.proj2 = _make_linear(bottleneck_dim, hidden_size, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj2(self.proj1(x))
+
+
+class TimestepEmbedder(nn.Module):
+    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.frequency_embedding_size = frequency_embedding_size
+        self.mlp_0 = _make_linear(frequency_embedding_size, hidden_size, bias=True,
+                                   kernel_init=NORMAL_INIT_002, bias_init=DEFAULT_BIAS_INIT)
+        self.mlp_2 = _make_linear(hidden_size, hidden_size, bias=True,
+                                   kernel_init=NORMAL_INIT_002, bias_init=DEFAULT_BIAS_INIT)
+
+    @staticmethod
+    def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+        half = dim // 2
+        freqs = torch.exp(-math.log(max_period)
+                           * torch.arange(0, half, dtype=torch.float32, device=t.device) / half)
+        args = t[:, None].to(torch.float32) * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        t_emb = self.mlp_0(self.timestep_embedding(t, self.frequency_embedding_size))
+        return self.mlp_2(F.silu(t_emb))
+
+
+def scaled_dot_product_attention(query, key, value, attn_mask: Optional[torch.Tensor] = None):
+    """query/key/value: (B, H, L|S, Dh). attn_mask: (B, S) or (B, L, S), 1=valid."""
+    bool_mask = None
+    if attn_mask is not None:
+        if attn_mask.dim() == 2:
+            bool_mask = attn_mask[:, None, None, :]
+        elif attn_mask.dim() == 3:
+            bool_mask = attn_mask[:, None, :, :]
+        else:
+            bool_mask = attn_mask
+        bool_mask = bool_mask.bool()
+    return F.scaled_dot_product_attention(query, key, value, attn_mask=bool_mask)
+
+
+class Attention(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = True,
+                 qk_norm: bool = True, attn_drop: float = 0.0, proj_drop: float = 0.0):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.qk_norm = qk_norm
+        self.proj_drop = proj_drop
+        head_dim = dim // num_heads
+        self.qkv = _make_linear(dim, dim * 3, bias=qkv_bias)
+        self.q_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
+        self.proj = _make_linear(dim, dim, bias=True)
+
+    def forward(self, x: torch.Tensor, rope_fn: Optional[nn.Module],
+                attention_mask: Optional[torch.Tensor] = None,
+                deterministic: bool = True) -> torch.Tensor:
+        B, N, C = x.shape
+        head_dim = self.dim // self.num_heads
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
+        if rope_fn is not None:
+            q, k = rope_fn(q), rope_fn(k)
+        x = scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
+        x = x.permute(0, 2, 1, 3).reshape(B, N, C)
+        x = self.proj(x)
+        if self.proj_drop > 0.0:
+            x = F.dropout(x, p=self.proj_drop, training=not deterministic)
         return x
 
 
-class DecoderLayer(nn.Module):
-    """Pre-LN self-attention (causal or bidirectional) + cross-attention to `context` +
-    MLP. Used identically by DLMDecoder (causal=False) and GPTDecoder (causal=True) so
-    the conditioning mechanism is the same for both, isolating the decoder's own
-    architecture as the variable under study."""
-
-    def __init__(self, d_model: int = 128, n_heads: int = 8, d_mlp: int = 512,
-                 dropout: float = 0.1, causal: bool = False):
+class SwiGLUFFN(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int, drop: float = 0.0, bias: bool = True):
         super().__init__()
-        self.causal = causal
-        self.ln1 = nn.LayerNorm(d_model)
-        # dropout=0 on both attention modules here for the same MPS-SDPA reason as
-        # EncoderLayer above; `self.dropout` below still regularizes each sublayer output.
-        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=0.0, batch_first=True)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=0.0, batch_first=True)
-        self.ln3 = nn.LayerNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, d_mlp), nn.GELU(), nn.Linear(d_mlp, d_model)
-        )
-        self.dropout = nn.Dropout(dropout)
+        hidden_dim_eff = int(hidden_dim * 2 / 3)
+        self.drop = drop
+        self.w12 = _make_linear(dim, 2 * hidden_dim_eff, bias=bias)
+        self.w3 = _make_linear(hidden_dim_eff, dim, bias=bias)
 
-    def forward(self, x: torch.Tensor, context: torch.Tensor,
-                context_mask: torch.Tensor | None = None) -> torch.Tensor:
-        # x: [B, L, D], context: [B, L_ctx, D], context_mask: [B, L_ctx] True=real
-        length = x.shape[1]
-        attn_mask = None
-        if self.causal:
-            attn_mask = torch.triu(
-                torch.full((length, length), float("-inf"), device=x.device), diagonal=1
-            )
-        h = self.ln1(x)
-        attn_out, _ = self.self_attn(h, h, h, attn_mask=attn_mask, need_weights=False)
-        x = x + self.dropout(attn_out)
-        h = self.ln2(x)
-        ctx_kpm = ~context_mask if context_mask is not None else None
-        cross_out, _ = self.cross_attn(h, context, context, key_padding_mask=ctx_kpm, need_weights=False)
-        x = x + self.dropout(cross_out)
-        h = self.ln3(x)
-        x = x + self.dropout(self.mlp(h))
-        return x
+    def forward(self, x: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
+        x1, x2 = self.w12(x).chunk(2, dim=-1)
+        hidden = F.silu(x1) * x2
+        if self.drop > 0.0:
+            hidden = F.dropout(hidden, p=self.drop, training=not deterministic)
+        return self.w3(hidden)
+
+
+class FinalLayer(nn.Module):
+    """Zero-initialized so the model starts as the identity flow (v=0) --
+    standard diffusion-transformer practice for training stability."""
+
+    def __init__(self, hidden_size: int, out_channels: int):
+        super().__init__()
+        self.norm_final = RMSNorm(hidden_size)
+        self.linear = _make_linear(hidden_size, out_channels, bias=True,
+                                    kernel_init=ZERO_INIT, bias_init=ZERO_INIT)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(self.norm_final(x))

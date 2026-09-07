@@ -1,1048 +1,440 @@
-# Architecture & Reference
+# Architecture
 
-This is the systematic companion to [`README.md`](README.md) (which tells the narrative
-story of the project). This document is a reference: every file's role, the exact data
-flow from raw graph to model batch, every design decision with its rationale, and every
-tunable and non-tunable variable in the codebase. Line numbers are omitted (files change);
-function/class names are given so you can jump to them with your editor's symbol search.
+This document explains every non-obvious design decision in this codebase
+and how the pieces fit together. It assumes you've read the Quickstart in
+[README.md](README.md).
 
-## 1. Pipeline overview
+## 1. The task
 
-Three independent stages, run in this order, each producing artifacts the next stage
-reads from disk:
+> Given a graph, find a diametric path -- any one of the graph's longest
+> shortest paths.
 
-```
-scripts/generate_data.py                    scripts/pretrain_encoder.py
-        |                                            |
-        v                                            v
-  data/*.pt, data/meta.json  ------------->  runs/encoder/checkpoint_*.pt
-        |                                            |
-        |                     +----------------------+
-        |                     |
-        v                     v
-scripts/train_dlm.py    scripts/train_arlm.py
-        |                     |
-        v                     v
-  runs/dlm/checkpoint_*.pt  runs/arlm/checkpoint_*.pt
-        |                     |
-        +----------+----------+
-                   |
-                   v
-   scripts/eval_only.py | eval_venn.py | dataset_stats.py
-```
+Formally: for a connected graph `G`, its diameter is
+`max over all (s, t) of dist_G(s, t)` (BFS distance, unweighted). A
+*diametric path* is any shortest `s->t` path whose length equals that
+maximum. The model is given only the graph (no source/target); it must
+output a full path, and that path's own endpoints and length are graded
+against the graph.
 
-`scripts/dataset_stats.py` only depends on stage 1's output and can be run any time
-after `generate_data.py`. Everything downstream of stage 2 (`pretrain_encoder.py`)
-depends on a completed encoder checkpoint, because both `train_dlm.py` and
-`train_arlm.py` load it via `--encoder_ckpt` and freeze it (`spelf/encoder.py`'s
-`load_frozen_encoder`) before their own training loop starts.
+## 2. Reference: ELF
 
-## 2. Repository map
+[ELF](https://github.com/lillian039/ELF) ("Embedded Language Flows") is a
+continuous diffusion language model: a frozen pretrained T5 encoder maps
+text to a continuous embedding sequence, a transformer denoises that
+sequence via flow matching (with a secondary decoder head that maps the
+final denoised embeddings to discrete tokens via cross-entropy), and Muon is
+the optimizer. The official repo's `main` branch is JAX; this project is
+built against its `pytorch_elf` branch, which is what "follow the ELF setup
+exactly (T5, Muon, etc.)" is grounded in here. Every module in `src/spelf/`
+that has a close ELF analog says so in its docstring and names what changed
+and why; this document is the higher-level version of the same story.
 
-| File | Role |
-|---|---|
-| [`src/spelf/tokenizer.py`](src/spelf/tokenizer.py) | Vocabulary, sequence encode/decode, fixed-length formulas. Single source of truth for parsing token ids, ground-truth or model-generated alike. |
-| [`src/spelf/graphgen.py`](src/spelf/graphgen.py) | Random connected graph sampling, diametric-pair enumeration, deterministic shortest-path tie-break. |
-| [`src/spelf/data_cache.py`](src/spelf/data_cache.py) | Orchestrates graph sampling → diametric-path selection → tokenization → cached tensors + `meta.json`. |
-| [`src/spelf/dataset.py`](src/spelf/dataset.py) | Thin `torch.utils.data.Dataset` wrappers around the cached tensors. |
-| [`src/spelf/modules.py`](src/spelf/modules.py) | Shared building blocks: `SharedEmbedding`, `LearnedPosEnc`, `TimeEmbedding`, `EncoderLayer`, `DecoderLayer`. |
-| [`src/spelf/encoder.py`](src/spelf/encoder.py) | `GraphEncoder` + its masked-language-model (MLM) pretraining objective. |
-| [`src/spelf/t5_encoder.py`](src/spelf/t5_encoder.py) | Optional T5-based encoders: `T5GraphEncoder` (T5 conditions AND the ARLM decodes into T5's own vocab) and `T5DiffusionEncoder` (T5 conditions AND the DLM diffuses directly in T5's own frozen embedding space — matches canonical ELF's actual use of T5) — see §6.5. |
-| [`src/spelf/dlm.py`](src/spelf/dlm.py) | `DLMDecoder` — ELF-style rectified-flow diffusion decoder (loss + Euler sampler). |
-| [`src/spelf/arlm.py`](src/spelf/arlm.py) | `GPTDecoder` — causal autoregressive decoder (loss + greedy sampler). |
-| [`src/spelf/muon.py`](src/spelf/muon.py) | `Muon` optimizer — the canonical ELF implementation's optimizer for the DLM's own hidden weight matrices (verified against arXiv:2605.10938 directly; see §6.8). |
-| [`src/spelf/metrics.py`](src/spelf/metrics.py) | Decodes raw generations and scores token-accuracy / exact-match / valid / shortest / correct-length / optimal rates. Model-agnostic. |
-| [`src/spelf/viz.py`](src/spelf/viz.py) | Ground-truth-vs-generated two-panel graph plots, for wandb image logging. |
-| [`src/spelf/common.py`](src/spelf/common.py) | Seeding, device selection, optimizer/LR-schedule construction, checkpoint save/load/resume, early stopping, wandb init, uniform `(context, context_mask)` dispatch across encoder backends. |
-| [`scripts/generate_data.py`](scripts/generate_data.py) | CLI wrapper around `data_cache.generate_all`. |
-| [`scripts/pretrain_encoder.py`](scripts/pretrain_encoder.py) | Trains `GraphEncoder` via MLM. |
-| [`scripts/train_dlm.py`](scripts/train_dlm.py) | Trains `DLMDecoder` against a frozen encoder. |
-| [`scripts/train_arlm.py`](scripts/train_arlm.py) | Trains `GPTDecoder` against a frozen encoder (same shape as `train_dlm.py`, minus diffusion-specific flags). |
-| [`scripts/eval_only.py`](scripts/eval_only.py) | Standalone checkpoint evaluation: prints/logs rates, optionally saves example plots. |
-| [`scripts/eval_venn.py`](scripts/eval_venn.py) | Standalone checkpoint evaluation rendered as a Venn diagram (valid/shortest/correct-length/optimal), ID + OOD. |
-| [`scripts/dataset_stats.py`](scripts/dataset_stats.py) | Computes and writes per-split token-count and graph-connectivity statistics for a generated dataset. |
-| [`tests/`](tests) | Unit tests: tokenizer round-trip, BFS tie-break, graph-generator connectivity, node-label-pool coverage. |
+**What's preserved exactly:** the transformer block design (RMSNorm, RoPE +
+QK-norm attention, SwiGLU FFN), the flow-matching objective (logit-normal
+time sampling, `v = (x0 - z) / (1 - t)`), the dual decoder(CE)/denoiser(L2)
+training branch selected per-example by a Bernoulli draw, self-conditioning
+with a learned self-cond-CFG guidance target, prefix conditioning tokens
+(time / self-cond-cfg / model-mode), the ODE/SDE sampler, and the Muon
+optimizer's Newton-Schulz-orthogonalized update rule with its bias-corrected
+Nesterov-Adam side channel for non-2D params.
 
-## 3. Data flow, end to end
+**What's adapted for this domain:** everything about *what text* flows
+through the system (Sections 3-4), the model's size (Section 5), and the
+training operational surface -- bf16 autocast, DDP, gradient-accumulation
+`no_sync()`, HF-Hub checkpoint upload, and PPL/BLEU/ROUGE online eval are
+all dropped, since they exist in ELF for multi-host TPU/GPU-scale runs and
+have no work to do at this project's CPU/MPS, single-process, ~1M-parameter
+scale. Where a simplification changes behavior, the affected module's
+docstring says so explicitly.
 
-**Stage A — graph → tensors** (`generate_data.py` → `data_cache.generate_all`):
+## 3. Data: graphs, splits, and the node-id label pool
 
-1. For each split, `graphgen.sample_graph(n, avg_degree, rng, label_pool_size=tok.MAX_NODES)`
-   draws an Erdős–Rényi graph on `n` nodes, reject-sampled until connected, then relabels
-   its nodes with a random `n`-subset of `{0..MAX_NODES-1}` (see §5.3 for why).
-2. `graphgen.graph_diameter` and `graphgen.diametric_pairs` compute the graph's diameter
-   and every node pair that achieves it; `graphgen.sample_diametric_paths` picks up to
-   `max_paths_per_graph` of those pairs and computes each one's canonical path via
-   `graphgen.shortest_path_lexsmallest` (deterministic tie-break, see §5.2).
-3. `data_cache.generate_labeled_split` turns each `(graph, path)` pair into an example
-   dict (`n`, shuffled `edges`, `node_list`, `path`, `diameter`, `graph_id`);
-   `generate_unlabeled_inputs` does the same without a path, for encoder pretraining.
-4. `data_cache.build_labeled_tensors` / `build_unlabeled_tensors` call
-   `tokenizer.encode_input` / `encode_target` / `pad_input` on every example and stack
-   the results into fixed-shape tensors (`input_ids`, `input_mask`, `target_ids`,
-   `n_nodes`, `graph_id`).
-5. Tensors are `torch.save`d as `train.pt` / `val_id.pt` / `val_ood.pt` /
-   `encoder_pretrain_extra.pt`; generation config + realized sizes go to `meta.json`
-   (read back everywhere via `dataset.load_meta`).
+### Generation (`spelf/graphgen.py`, `spelf/data_cache.py`)
 
-**Stage B — tensors → training batch** (`dataset.py`, used by all three training
-scripts and both eval scripts):
+Graphs are Erdos-Renyi `G(n, p)`: `n` nodes, each of the `n*(n-1)/2`
+possible edges present independently with probability `p`. Two properties
+this task needs that plain `G(n, p)` doesn't guarantee:
 
-- `dataset.PathDataset` wraps one of the three labeled `.pt` files; each `__getitem__`
-  returns one example's `input_ids`/`input_mask`/`target_ids`/`n_nodes`/`graph_id`.
-- `dataset.EncoderPretrainDataset` concatenates `train.pt`'s inputs with
-  `encoder_pretrain_extra.pt`'s inputs (no path fields) — this is the *only* place those
-  two files' inputs are combined; the decoders never see `encoder_pretrain_extra.pt`.
-- `dataset.collate_fn` is the default per-key stack (examples are already fixed-shape and
-  pre-padded), named explicitly for clarity at every `DataLoader(..., collate_fn=...)`
-  call site.
+- **Connectivity** (a diameter is undefined otherwise): `p` is drawn per
+  graph as a random multiple (`edge_prob_min_factor`..`edge_prob_max_factor`,
+  default 1.2x-2.5x) of the Erdos-Renyi connectivity threshold `ln(n)/n`,
+  clipped to `[edge_prob_floor, edge_prob_ceil]`. If the sampled graph still
+  turns out disconnected (or has more than `max_edges` edges, to bound
+  sequence length), it's rejected and resampled -- rejection sampling, not a
+  different generative model, so the result is still "Erdos-Renyi" graphs,
+  just conditioned on being usable.
+- **A well-defined, reproducible ground-truth path** even when several
+  pairs tie for the diameter, or several shortest paths connect the same
+  pair (`find_diametric_example`, `shortest_path`): the diametric pair is
+  the lexicographically-smallest `(s, t)` achieving the maximum distance,
+  and the reported path is the lexicographically-smallest shortest path
+  between them (greedily walk from `s`, always taking the smallest-id
+  neighbor whose distance-to-`t` decreased by exactly one). Both rules are
+  independent of adjacency-list iteration order, so the same graph always
+  produces the same ground truth. (Ground truth is only used to build
+  training targets -- eval scores the *model's* output against the graph
+  directly, since several different paths can be equally correct diametric
+  paths; see Section 8.)
 
-**Stage C — batch → conditioning context** (`common.encode_context`, used by every
-training/eval loop):
+### Node-id label pool
 
-- Runs the frozen encoder (`GraphEncoder` or `T5GraphEncoder`) on `(input_ids,
-  input_mask)` and returns `(context, context_mask)` uniformly regardless of which
-  encoder backend is in play (`GraphEncoder`'s output sequence is length-aligned with
-  `input_ids`, so `context_mask := input_mask`; `T5GraphEncoder` re-tokenizes the graph
-  as text and returns its own mask — see §6.5).
-- Always wraps the call in `torch.no_grad()` **except** when the encoder declares
-  `context_requires_grad = True` (only `T5GraphEncoder`, whose frozen T5 stack still
-  needs gradient to flow to its trainable projection/embedding).
+The task spec fixes ID = 6-10 nodes, OOD = 11-14 nodes, and separately
+requires that node ids be drawn from the *full* OOD range so every id
+appears during ID training. Concretely: the node universe is
+`range(ood_max_nodes)` (default `range(14)`), and *every* graph -- ID or OOD
+-- picks its `n` node labels as a random subset of that full range, not of
+`range(n)`. An ID graph with 8 nodes might be labeled `{1, 4, 9, 11, 12, 13,
+2, 7}` -- ids up to 13 appear routinely in 8-node graphs.
 
-**Stage D — context + target → loss, or context → generation:**
+This is a deliberate control: it isolates *OOD by graph size/structure* from
+*OOD by unseen vocabulary/labels*. Without it, an ID-trained model failing on
+OOD graphs could conflate "it never saw node 12 used this way" with "it can't
+reason about 14-node structures" -- this design removes that confound.
+(With the real T5 tokenizer -- Section 4 -- individual digit/number *tokens*
+like `"12"` are common regardless of graph size, since T5 was pretrained on
+huge amounts of text containing numbers; what this control actually isolates
+is whether the model has seen a given node *label* playing a structural role
+-- an endpoint, a hub, a leaf -- during ID training, not merely whether its
+token embedding is initialized. That's a meaningful ablation either way.)
+`tests/test_label_pool.py` checks the coverage property directly.
 
-- Training: `dlm.loss(model, context, context_mask, target_ids, ...)` or
-  `arlm.loss(model, context, context_mask, target_ids)` — see §6.6/§6.7.
-- Inference/eval: `model.generate(context, context_mask, **sample_kwargs)` — both
-  `DLMDecoder` and `GPTDecoder` expose this identical interface, so `metrics.run_eval`
-  and every eval script call it without knowing which decoder it is.
+### Splits
 
-**Stage E — generation → metrics/plots** (`metrics.py`, `viz.py`):
+`scripts/generate_data.py` writes three JSONL files under `data_dir`, each
+from an independent RNG stream (`data_seed`, `data_seed+1`, `data_seed+2`):
+`train.jsonl` (ID), `id_val.jsonl` (ID, held out -- the in-distribution eval
+set), `ood_test.jsonl` (OOD). Nothing is generated on the fly during
+training or eval; every script reads these cached files.
 
-- `metrics.evaluate_generation` decodes a raw generated id sequence with
-  `tokenizer.decode_target` (returns `None` on anything malformed, never raises), rebuilds
-  the graph from the input with `tokenizer.decode_input`, and scores `valid` /
-  `shortest` / `correct_length` / `optimal` / `exact_match` / `token_accuracy` (see §7 for
-  exact definitions).
-- `metrics.run_eval` batches this over a `DataLoader`, returning aggregate rates plus a
-  list of per-example dicts.
-- `viz.plot_example` takes one such per-example dict and renders a two-panel
-  ground-truth-vs-generated `networkx.spring_layout` figure, laid out deterministically
-  from the graph's own content (`viz._content_seed`) so the same graph always looks the
-  same across training steps.
-
-## 4. Vocabulary & sequence format (non-tunable)
-
-Defined entirely in [`tokenizer.py`](src/spelf/tokenizer.py); nothing here is a CLI flag.
+### Serialization and tokenizer (`spelf/dataset.py`, `spelf/tokenizer.py`)
 
 ```
-Token ids:  0 <PAD>  1 <G>  2 <E>  3 <N>  4 <P>  5 <EOS>  6 <MASK>   7..20 node-id 0..13
-Input:      <G> u1 v1 <E> u2 v2 <E> ... <N> n0 n1 ... n(k-1)
-Target:     <P> p0 p1 ... p(L-1) <EOS> <PAD> <PAD> ...
+condition:  nodes: <n0> <n1> ... edges: <u0> - <v0> <u1> - <v1> ... find diametric path
+target:     <p0> <p1> ... <pk>                          (+ EOS, appended at encode time)
 ```
 
-- `MAX_NODES = 14` — the largest graph size the OOD split uses; fixes the vocabulary so
-  ID and OOD share every node-id token (no OOD-vocab problem).
-- `VOCAB_SIZE = 7 + MAX_NODES = 21`.
-- `TARGET_LENGTH = MAX_NODES + 2 = 16` — one global fixed target canvas (`<P>` + up to
-  `MAX_NODES` path nodes + `<EOS>`) used for *every* graph size, ID or OOD. This isn't
-  just a padding convenience: the DLM diffuses over a fixed-size tensor `[L_TGT, D]`, so
-  the target length must be a single constant across the whole dataset, not a
-  per-example `n + 2`.
-- Input length is per-example and varies: `input_length(n, m) = n + 3m + 2`
-  (`<G>` + 3 tokens/edge + `<N>` + `n` node-id tokens). `data_cache.max_input_length`
-  takes the max over *all four splits* once at generation time and records it as `l_in`
-  in `meta.json`; every input is padded out to that one shared value so encoder tensors
-  have one constant shape too.
-- `decode_input`/`decode_target` are the **single source of truth** for parsing ids back
-  into a graph/path — used identically for ground truth (at data-generation time) and
-  for possibly-malformed model output (at eval time). Both return `None` on a
-  structural violation (missing/duplicated markers, non-node tokens in the wrong place,
-  content after the `<N>`-list, etc.) rather than raising, so a broken generation is
-  just scored as invalid, never crashes an eval loop. `decode_target` is the one
-  exception to "content after a marker is rejected": content after `<EOS>` is
-  truncated, not validated — see §6.6 for why.
-
-## 5. Data-generation design decisions
-
-Source: [`graphgen.py`](src/spelf/graphgen.py), [`data_cache.py`](src/spelf/data_cache.py).
-
-### 5.1 The task itself: diametric path, not shortest path
-
-The input encodes *only* a graph — no query pair. The model must find *some* pair of
-nodes and a path between them whose length equals the graph's diameter. This is checked
-independently by `graphgen.diametric_pairs` (all pairs at maximum pairwise distance) —
-there is often more than one, so a graph can validly train on (and be scored against)
-several different correct answers.
-
-### 5.2 Deterministic shortest-path tie-break
-
-`graphgen.shortest_path_lexsmallest(G, start, end)`: BFS distances computed *from `end`*,
-then the path is reconstructed from `start` by always stepping to the smallest-id
-neighbor whose distance-to-`end` is exactly one less than the current node's. This is a
-greedy algorithm that provably yields the lexicographically-smallest shortest path (every
-candidate considered at each step lies on *some* shortest path by the distance
-invariant, and picking the smallest can never rule out a smaller full path later). It
-exists purely so that training targets are **reproducible** given a seed — without a
-tie-break, "the" shortest path between a diametric pair would be an arbitrary function of
-BFS traversal order.
-
-### 5.3 Node labels drawn from a pool wider than the graph
-
-`sample_graph(n, avg_degree, rng, label_pool_size=tok.MAX_NODES)` relabels a freshly
-sampled `n`-node graph with a random `n`-subset of `{0, ..., MAX_NODES-1}` rather than
-contiguous `0..n-1`. Consequence: **graph size is the only axis that distinguishes ID
-from OOD** — every node-id *token value* the model can be asked to emit already appears
-in ID-sized (6–10 node) training graphs, so OOD evaluation (11–14 nodes) tests
-generalization to larger search spaces, not to literally unseen output tokens.
-`data_cache.assert_full_node_id_coverage` asserts this holds for `train.pt` after every
-generation run — a bug here would produce a `sample_graph`-not-`generate_all` assertion
-failure with an explicit message, so it's treated as a real bug if it ever fires rather
-than expected sampling variance (with `label_pool_size=14` drawn independently across
-50,000 training graphs, the chance any single node-id is never drawn is astronomically
-small).
-
-Because `_rebuild_graph`/`viz.plot_example` iterate a graph's real node set as
-`node_list` (not `range(n)`), this labeling scheme required threading `node_list`
-explicitly through the tokenizer, data cache, metrics, and viz code — see the comments
-in `metrics._rebuild_graph` and `viz.plot_example` for the specific failure mode this
-avoids (spurious "phantom" nodes if `range(n)` were used instead).
-
-### 5.4 Held-out splits generated *first*, train resampled around them
-
-`data_cache.generate_all` samples `val_id`/`val_ood` before `train`, collects their
-`graph_key()`s into `held_out_keys`, and passes that as `forbidden_keys` into
-`generate_labeled_split`/`generate_unlabeled_inputs` for `train` and
-`encoder_pretrain_extra` — each reject-resamples (up to `max_resample_tries=200`) any
-graph that collides with a held-out key. This ordering matters: for small `n` (e.g. 6
-nodes has only 15 possible edges), the space of likely Erdős–Rényi outcomes is small
-enough that generating train first and merely *checking* disjointness afterward would
-fail in practice — birthday-paradox collisions between a 50,000-graph train split and a
-500-graph val split are near-guaranteed at that scale. Resampling around a reserved set
-this small succeeds within a handful of tries even though the underlying space is small.
-`data_cache.assert_disjoint_graphs` re-verifies disjointness explicitly after generation
-as a hard assertion, independent of whether resampling worked as intended.
-
-`graph_key(n, edges)` is the canonical, order/direction-independent graph identity used
-throughout: `(n, frozenset(sorted edge tuples))`.
-
-### 5.5 Multiple paths per graph, capped
-
-Each graph contributes one training example per distinct diametric pair, up to
-`max_paths_per_graph` (subsampled if more exist, all of them if fewer). A graph whose
-diameter is achieved by several pairs (e.g. every antipodal pair on an even cycle) thus
-trains the model on all of its correct answers, while a graph with a unique diametric
-pair contributes exactly one example — never padded to look like it has `k` paths. The
-same cap, reinterpreted, controls how many independently edge-order-shuffled copies of
-each graph appear in the *unlabeled* encoder-pretraining corpus (`generate_unlabeled_inputs`),
-where there's no notion of "path" to multiply by at all.
-
-Consequence documented and verified in `dataset_stats.py`'s output (see
-`data/dataset_stats.txt`): because low-diameter graphs systematically have more
-diametric pairs than high-diameter graphs, an **example-weighted** statistic (e.g. mean
-diameter implied by target lengths) differs from the corresponding **graph-weighted**
-statistic (mean diameter over unique graphs) — not a bug, an expected artifact of this
-per-graph example multiplicity.
-
-### 5.6 Encoder pretraining's extra unlabeled OOD corpus
-
-`encoder_pretrain_extra.pt` (unlabeled, 11–14 node graphs) exists solely because
-`GraphEncoder` uses **learned** positional encodings: if pretraining only ever saw 6–10
-node inputs, positions past the 6–10-node range would be untrained garbage when the
-encoder is later asked (at DLM/ARLM eval time) to encode an 11–14 node OOD graph — an
-artifact that would contaminate exactly the ID-vs-OOD comparison this project measures.
-Critically, this corpus carries **no path/answer labels** — the encoder never sees
-diametric-path supervision, so this doesn't leak OOD reasoning-task signal into the
-comparison, only positional/structural exposure. `dataset.EncoderPretrainDataset`
-concatenates it with `train.pt`'s inputs (paths dropped) at load time; it's never
-touched by `train_dlm.py`/`train_arlm.py`.
-
-### 5.7 Seeding scheme
-
-One `--seed` fans out into four independent `numpy.random.default_rng` streams via fixed
-large offsets (`data_cache.SEED_OFFSETS`: train `+0`, val_id `+1_000_000`, val_ood
-`+2_000_000`, encoder_pretrain_extra `+3_000_000`) so each split's sampling is
-reproducible and independent of the others under a shared top-level seed. `graph_id`
-values are similarly kept in disjoint numeric ranges per split (train starts at 0,
-val_id at `10**9`, val_ood at `2*10**9`) purely so ids never collide across splits if
-ever concatenated — not otherwise meaningful.
-
-## 6. Model architecture design decisions
-
-Source: [`modules.py`](src/spelf/modules.py), [`encoder.py`](src/spelf/encoder.py),
-[`dlm.py`](src/spelf/dlm.py), [`arlm.py`](src/spelf/arlm.py),
-[`t5_encoder.py`](src/spelf/t5_encoder.py).
-
-### 6.1 One shared embedding table across encoder + both decoders
-
-`modules.SharedEmbedding` wraps a single `nn.Embedding(vocab_size, d_model)`. It is
-constructed once (inside `GraphEncoder.__init__` or standalone in
-`pretrain_encoder.py`), pretrained as part of the encoder's MLM objective, and then
-passed **by object reference** into whichever decoder is being trained
-(`DLMDecoder(..., embedding=encoder.embedding)` / same for `GPTDecoder`) — not copied.
-This mirrors how ELF diffuses directly inside a frozen pretrained embedding space
-(there, T5's; here, the from-scratch graph encoder's own).
-
-The wrinkle: `<P>` and `<EOS>` never appear in the encoder's own input (only in
-decoder path targets), so encoder pretraining would never touch those two rows.
-`SharedEmbedding.freeze_pretrained_rows(trainable_token_ids=(tok.P, tok.EOS))` installs a
-gradient hook that zeros the gradient for every row *except* those two, called once
-by `GraphEncoder.freeze()` right after encoder pretraining finishes. Combined with
-excluding embeddings from weight decay in `common.build_optimizer` (necessary — AdamW's
-weight decay would otherwise keep shrinking the "frozen" rows despite their zeroed
-gradient), this makes the shared table a true frozen copy of what the encoder learned,
-except for two rows that keep training downstream.
-
-Embedding init: `nn.init.normal_(weight, mean=0.0, std=0.02)` — the conventional
-small-std init (BERT/GPT-2 style). Chosen explicitly over PyTorch's default `N(0,1)` per
-element, because a 128-dim row at unit variance has norm ≈√128, and dotting two such rows
-in `SharedEmbedding.unembed` (`x @ weight.T`) would produce huge, poorly-calibrated
-logits before any training happens.
-
-### 6.2 `EncoderLayer` vs `DecoderLayer`: one shared conditioning mechanism
-
-Both `DLMDecoder` and `GPTDecoder` use the identical `modules.DecoderLayer` (self-attn →
-cross-attn to `context` → MLP, Pre-LN), differing only in `causal` (`False` for DLM,
-`True` for ARLM, applied via a `-inf`-filled upper-triangular additive attention mask).
-This is a deliberate experimental control: since both decoders condition on the graph via
-the exact same cross-attention block wired to the exact same frozen encoder output, the
-decoder's *own* architecture (diffusion vs. autoregressive) is isolated as the one
-variable under study — a difference in results can't be attributed to a different
-conditioning mechanism.
-
-`modules.EncoderLayer` (used only by `GraphEncoder`) is simpler: bidirectional
-self-attention + MLP, no cross-attention, no causal mask.
-
-### 6.3 Attention dropout hardcoded to 0, MLP/residual dropout tunable
-
-Every `nn.MultiheadAttention` in this codebase (`EncoderLayer.self_attn`,
-`DecoderLayer.self_attn`/`cross_attn`) is constructed with `dropout=0.0` **regardless**
-of the `--dropout` CLI flag — a hard platform constraint, not a design choice:
-`nn.MultiheadAttention`'s scaled-dot-product-attention fast path raises
-`NotImplementedError` for `dropout_p>0` during training on MPS. Regularization for these
-sublayers still comes from `self.dropout` (the CLI-tunable `--dropout`, default 0.1)
-applied to each sublayer's *output* before the residual add.
-
-### 6.4 GraphEncoder pretraining objective (masked node-token prediction)
-
-`encoder.mlm_forward`: masks a random `~mlm_prob` fraction of **node-id token
-positions only** (edge endpoints, `<N>`-list entries) — structural markers
-(`<G>`/`<E>`/`<N>`) are never masked, since the useful self-supervised signal here is
-relational understanding of node identity/connectivity, not of the fixed, trivially
-predictable grammar. Masked positions get replaced with `<MASK>`; loss is cross-entropy
-via the tied unembedding (`model.embedding.unembed`) at masked positions only
-(`ignore_index=-100` elsewhere).
-
-`GraphEncoder.freeze()` sets `requires_grad=False` on every parameter except the
-embedding table (which keeps `requires_grad=True` module-wide so `<P>`/`<EOS>` can still
-train downstream, gated instead by the gradient hook from §6.1) and calls `.eval()`.
-Callers (`common.encode_context`) must still wrap the encoder's forward pass in
-`torch.no_grad()` during downstream DLM/ARLM training even though the module's own
-`requires_grad` flags say frozen — because the embedding table's `<P>`/`<EOS>` rows are
-*not* frozen, and this conditioning path should never contribute gradient to them (they
-should only train via the decoder's own target-embedding lookups).
-
-### 6.5 Optional T5 encoders (`t5_encoder.py`) — two different designs for two different decoders
-
-`--encoder_kind t5` selects T5 over this project's own `GraphEncoder`, but the DLM and
-ARLM use it in two structurally different ways — because "use T5" means something
-different depending on whether the decoder is autoregressive or diffusion-based. This
-was a deliberate correction made partway through this project (see the conversation that
-introduced `T5DiffusionEncoder`): the original design used T5 purely as a conditioning
-source for *both* decoders, which is a reasonable, ordinary choice for the ARLM but does
-not reflect what the canonical ELF paper (arXiv:2605.10938) actually does with T5 for a
-diffusion decoder — verified directly against the paper before making this distinction.
-
-**`T5GraphEncoder`** (used by `GPTDecoder` + T5) — T5 as a conditioning source, and (see
-below) also as the decoder's own output vocabulary. Originally used a trainable `proj:
-nn.Linear(t5_hidden, d_model)` plus a *tied* `SharedEmbedding` over this project's own
-21-token vocab (mirroring `GraphEncoder`'s convention); both were revisited and changed
-across two rounds of the same conversation that added `T5DiffusionEncoder` — first
-dropping `proj`/tying (neither was load-bearing here), then switching the decoder's own
-target vocabulary from this project's 21 tokens to T5's own ~32k, once there was no
-longer a reason to keep the small vocabulary around at all. Key properties now:
-- `T5GraphEncoder.forward` first serializes the decoded graph to an English sentence
-  (`graph_to_text`) and retokenizes with T5's own tokenizer — so its output
-  sequence length/mask are **unrelated** to `input_mask`, unlike `GraphEncoder` (whose
-  output is length-aligned with its own input). This is exactly why
-  `common.encode_context` exists as a uniform dispatch point rather than every call site
-  assuming `context_mask := input_mask`.
-- **No `proj` layer.** Same reasoning as `T5DiffusionEncoder` (§6.5 below): T5's
-  embedding dimension and hidden-state dimension are the same throughout its stack, so
-  `self.d_model = self.t5.config.d_model` (derived, not a free CLI choice) and
-  `last_hidden_state` is used directly as cross-attention context — tying the two
-  systems' dimension the same way the DLM's does. `GPTDecoder`'s own `d_model` must
-  therefore match T5's exactly.
-- **`self.embedding` is `UntiedEmbedding`, sized to T5's vocabulary, not
-  `SharedEmbedding`.** `GPTDecoder` now decodes directly *into T5's own ~32k-token
-  vocabulary* (`vocab_size = len(self.t5_tokenizer)`, the tokenizer's real, tight usable
-  id range — not `T5EncoderModel`'s embedding table size, 32128 for t5-small, which is
-  merely rounded up for hardware efficiency and includes rows the tokenizer can never
-  actually produce) rather than this project's own 21-token one; training targets are
-  T5's own tokenization of `path_to_text(path)` (`T5GraphEncoder.tokenize_path_targets`,
-  mirroring `T5DiffusionEncoder.tokenize_path_targets` below, but prepending T5's own
-  `pad_token_id` as a decoder-start marker — T5 has no dedicated BOS token, so this
-  mirrors the standard `decoder_start_token_id = pad_token_id` T5/seq2seq convention).
-  Despite now sharing T5's vocabulary, there is still no pretrained embedding space
-  worth tying into: T5's own embedding table is a separate, frozen object entirely
-  (never referenced by `UntiedEmbedding`), and an autoregressive decoder's output
-  vocabulary being T5-shaped doesn't make T5's own embeddings the right *values* to
-  start from. `UntiedEmbedding` is an ordinary `nn.Embedding(vocab_size, d_model)`
-  (input) + a separate `nn.Linear(d_model, vocab_size)` (`lm_head`, output) — genuinely
-  independent parameters, no weight tying at all, exactly what a from-scratch GPT
-  decoder head normally looks like, just aimed at a much larger target. Both pieces
-  train from scratch; the T5 stack itself stays frozen (`T5GraphEncoder.freeze`), and
-  `.train()` is overridden so a stray recursive `.train()` call from a parent module can
-  never toggle its dropout back on.
-- **`l_tgt_t5 = compute_l_tgt_t5(t5_tokenizer) + 1`** — the `+1` (beyond
-  `T5DiffusionEncoder`'s own use of the same helper) accounts for the prepended
-  decoder-start marker. `tokenize_path_targets` asserts (rather than silently
-  truncating) if a real path's tokenization plus that marker would exceed it.
-- **Generation start/stop/pad ids are no longer `tokenizer.P`/`EOS`/`PAD`.**
-  `arlm.loss`/`arlm.sample`/`GPTDecoder.generate` were parameterized
-  (`pad_id`/`start_id`/`eos_id`, all defaulting to the project-vocab constants for
-  backward compatibility with `--encoder_kind custom`) rather than hardcoding them, so
-  `train_arlm.py`/`eval_only.py`/`eval_venn.py` pass T5's own `pad_token_id` (for both
-  `start_id` and `pad_id`) and `eos_token_id` when `--encoder_kind t5`. `arlm.py` itself
-  needed this parameterization — unlike `dlm.py` (never touched by the DLM's own T5
-  redesign, since nothing inside `dlm.sample`'s loop hardcodes a vocab-specific
-  sentinel) — because the autoregressive sampling loop bakes the start/stop tokens
-  directly into its generation logic, not just into the surrounding data pipeline.
-- `context_requires_grad = False` (checked by `common.encode_context`) — nothing
-  upstream of the returned `(context, context_mask)` is trainable anymore (`embedding`
-  is downstream, consumed by the decoder's own lookups, not produced by this forward
-  pass), so the whole forward pass can safely run under `torch.no_grad()` from the
-  caller's side, same as `GraphEncoder`/`T5DiffusionEncoder`.
-- `trainable_state_dict()`/`load_trainable_state_dict()` checkpoint only `embedding` —
-  the frozen T5 stack is fully reproducible from `--t5_model_name` alone, so re-saving
-  tens of millions of frozen params on every checkpoint would be pure waste. (This
-  changed the ARLM+T5 checkpoint schema — an ARLM+T5 checkpoint saved before this change
-  has `{"proj": ..., "embedding": ...}` here and a `d_model=128`-shaped `model_state`;
-  neither loads cleanly against the current code, since both the parameter shapes and
-  the trainable-state dict's keys changed.)
-
-**`T5DiffusionEncoder`** (used by `DLMDecoder` + T5) — T5 as the DLM's actual diffusion
-space, matching what the canonical ELF paper does: the DLM diffuses directly in T5's own
-frozen token embedding table, not a separately-trained small one. Concretely:
-- `self.embedding = T5TiedEmbedding(self.t5.get_input_embeddings())` — a thin,
-  parameter-free adapter (`forward`/`unembed`/`.weight`) wrapping T5's own frozen
-  embedding table (a view, not a copy) so `DLMDecoder(..., embedding=encoder.embedding)`
-  works completely unchanged regardless of which embedding kind it received.
-- `self.d_model = self.t5.config.d_model` (512 for t5-small) — derived, not a free CLI
-  choice, since `x = T5_embedding(target_ids)` must live in that exact space.
-- **No `proj` layer.** T5's `last_hidden_state` and its embedding table share the same
-  dimension throughout T5's stack (standard T5 architecture: `d_model` is uniform across
-  embeddings and all hidden states, unlike the FFN's separate, larger `d_ff`), so once
-  the decoder's own `d_model` matches T5's, `last_hidden_state` can be used directly as
-  cross-attention context — verified via `T5EncoderModel.config.d_model` and the shape
-  of `last_hidden_state` before relying on it.
-- **Zero trainable parameters.** Everything (`self.t5` including its embedding table) is
-  frozen (`freeze()`); `trainable_state_dict()`/`load_trainable_state_dict()` are no-op
-  stubs kept only so `train_dlm.py`'s checkpoint code doesn't need a special case.
-  Consequently, this also eliminates the `<P>`/`<EOS>`-needs-separate-training problem
-  entirely for T5 mode (see §6.1) — T5's own pretraining corpus already contains
-  ordinary tokens like "Path", ":", "." with well-trained embeddings, unlike the
-  from-scratch `SharedEmbedding` case where those two markers start at random init.
-- **Target representation**: training targets are no longer
-  `tokenizer.encode_target(path)` — they're T5's own tokenization of
-  `path_to_text(path)` (e.g. `"Path : 3 - 7 - 4 - 5 ."`), produced by
-  `tokenize_path_targets`, padded/truncated to a fixed `l_tgt_t5`
-  (`compute_l_tgt_t5`) computed once from the *analytically worst-case* path — every
-  node's own graph uses at most `tok.MAX_NODES` distinct nodes (a path can't repeat a
-  node), and every node-id number contributes exactly one T5 token regardless of digit
-  count (verified against 2000+ random paths, none exceeding the constructed worst
-  case), so tokenizing `path_to_text(list(range(tok.MAX_NODES)))` gives a safe, tight
-  upper bound without needing to scan the dataset. `tokenize_path_targets` still asserts
-  (rather than silently truncating) if some path's tokenization ever exceeds this,
-  turning a violated assumption into a loud failure.
-- **Node-id token-boundary safety**: `graph_to_text`/`path_to_text` bound every
-  number with a literal space on both sides — including around `-`, `,`, and before
-  `.` — rather than writing it bare (the old `"3-7"` format). A space is a hard token
-  boundary for SentencePiece/BPE tokenizers, so this *guarantees* no node id can ever
-  share a token with a different node id, regardless of the tokenizer's specific BPE
-  merges. This isn't just asserted — it was verified directly against T5's real
-  tokenizer (the old unspaced format really does fuse some node-id pairs into a single
-  token, e.g. `"1-4"`; the spaced format never does), and `scripts/inspect_t5_tokenization.py`
-  re-verifies it automatically against real dataset examples every time it's run (see §9).
-- Both `DLMDecoder` and (now) `GPTDecoder`'s raw T5-vocab-id generations are unreadable
-  to `metrics.py`/`viz.py` as-is. `T5SpaceDecoderAdapter` wraps either one so it exposes
-  the exact same `.generate(context, context_mask, **kwargs) -> LongTensor[B,
-  tokenizer.TARGET_LENGTH]` interface (in the *project's own vocab*) every other decoder
-  exposes: it detokenizes a generation via `decode_t5_path_ids`, and re-encodes a
-  successfully parsed path via `tokenizer.encode_target` — an unparseable generation (or
-  one whose path is too long for `TARGET_LENGTH`) is left as an all-`<PAD>` row, which
-  `tokenizer.decode_target` already treats as invalid (its first required token is
-  `<P>`). This is what lets `metrics.run_eval`/`viz.plot_example` stay completely
-  unaware T5 was ever involved — `train_dlm.py`/`train_arlm.py`/`eval_only.py`/
-  `eval_venn.py` construct this adapter locally and pass it wherever a decoder is handed
-  to `metrics.run_eval`, never to `dlm.loss`/`arlm.loss` (training loss always operates
-  on the raw model with real T5-space target ids). `drop_first_token=True` (ARLM only)
-  strips `arlm.sample`'s prepended decoder-start marker before decoding — the DLM's raw
-  generation has no such marker, so it defaults to `False`.
-- `decode_t5_path_text`/`decode_t5_path_ids` are the T5-space analogues of
-  `tokenizer.decode_target` — same division of responsibility (format parsing only, not
-  semantic path validity) and same strictness about trailing content after the stop
-  marker (`</s>`/`<pad>` here, `<EOS>`/`<PAD>` there).
-
-Both T5 classes require `transformers`/`sentencepiece` (see
-[`requirements.txt`](requirements.txt)), otherwise unused.
-
-### 6.6 DLMDecoder: ELF-style rectified-flow decoder
-
-`dlm.DLMDecoder.forward(z_t, t, context, context_mask, mode, self_cond)` predicts a
-clean embedding `x_hat` (x-prediction, not noise-prediction) from a noisy input `z_t`,
-diffusion time `t`, cross-attention context, a `mode` flag (`DENOISE_MODE=0` /
-`DECODE_MODE=1`, added as a learned per-mode embedding so one network serves both
-training branches), and an optional self-conditioning input.
-
-`dlm.loss` (one training step):
-1. **Context dropout** (`cfg_dropout_prob`, default 0.1): per-example, replace `context`
-   with the model's learned `null_context` — enables optional classifier-free guidance
-   (CFG) at sampling time.
-2. **Branch assignment**: each example is randomly assigned to the **denoise branch**
-   (probability `1 - decode_branch_prob`, default 0.8) with `t ~ Uniform(0, 1-eps)`, or
-   the **decode branch** (probability `decode_branch_prob`, default 0.2) with
-   `t ~ Uniform(0.5, 1.0)` (near-clean).
-3. **Forward-process interpolation**: `z_t = t·x + (1-t)·ε`, `x` = clean target
-   embeddings, `ε ~ N(0,I)` — this is the *rectified flow* interpolation (linear path
-   from noise to data), not a diffusion-SDE forward process.
-4. **Self-conditioning** (`selfcond_prob`, default 0.0 = off): with this probability, an
-   extra no-grad forward pass with `self_cond=0` produces `x_hat'`, which is fed
-   (detached) as the real forward pass's `self_cond` input.
-5. **Single shared forward pass**, `mode` varying per example, produces `x_hat` for
-   every example regardless of its assigned branch.
-6. **Loss routing**: denoise-branch examples get reweighted MSE
-   `(1/((1-t)^2+eps))·‖x_hat - x‖^2` (the reweighting emphasizes small `t`, i.e. noisier
-   inputs — standard for x-prediction rectified-flow training); decode-branch examples
-   get cross-entropy on `unembed(x_hat)` against `target_ids`. **Both `denoise_loss` and
-   `decode_loss` exclude `pad_id` positions** (default `tok.PAD`) — the per-example mean
-   for each is taken over that example's own real (non-pad) position count, computed
-   once as a shared `real_mask`/`n_real` (mirroring `metrics.py`'s `token_accuracy_nopad`
-   pattern). This was originally decode-only (an earlier iteration of this file reasoned
-   that `denoise_loss` needed to stay unmasked to teach the model where `<PAD>` belongs,
-   since the DLM has no autoregressive stop-and-fill mechanism the way `arlm.sample` has
-   — see §6.7); that reasoning was superseded after checking the actual canonical ELF
-   implementation's source (github.com/lillian039/ELF, `src/train_step.py`, not just its
-   paper — the paper's own loss equations show no masking either way). Its reference
-   code builds one `loss_mask` from the batch's real-content mask and applies that same
-   mask to *both* its L2/denoising loss and its CE/decode loss whenever the tokenizer
-   uses a dedicated pad token distinct from EOS (this project's tokenizer always does).
-   The resolution to the original concern: the model doesn't need to learn what belongs
-   after `<EOS>` at all, because nothing downstream checks it — `tokenizer.decode_target`
-   (and `t5_encoder.decode_t5_path_ids`) read a generation by truncating at the first
-   `<EOS>`, not by validating that the tail is literal `<PAD>` (this parsing relaxation
-   is the necessary companion change; without it, a DLM generation's untrained,
-   effectively-arbitrary tail would almost never happen to equal literal `<PAD>` by
-   chance, marking every generation invalid regardless of whether its real content was
-   correct — see §4). Masking `denoise_loss` too also incidentally fixes the original
-   motivating symptom (`decode_loss` collapsing toward exact `0.0` within ~100 steps,
-   well before the model had learned real path content, because most of a `L_TGT`
-   canvas is padding and placing it correctly is a far easier pattern to learn first) at
-   its root, rather than only hiding it from one of the two loss terms.
-
-`dlm.sample` (inference): `z_0 ~ N(0,I)` over `[B, L_TGT, D]`; Euler-integrates
-`dz/dt = (x_hat - z)/(1 - t + eps)` for `num_sample_steps` (default 32) equal steps from
-`t=0` to `t≈1`, always running the network in `DENOISE_MODE`; if `guidance_scale != 1.0`
-each step also runs an unconditional (`null_context`) pass and linearly combines them
-(`guidance_scale=1.0`, the default, skips this entirely — CFG is off by default because
-generation here is always meant to be graph-conditioned, unlike ELF's unconditional
-text-generation use case, but the mechanism is wired for sweeps). A final `DECODE_MODE`
-forward pass + `argmax(unembed(x_hat))` converts the final continuous state to discrete
-tokens. `use_self_cond` must match how the checkpoint was *trained* (`selfcond_prob > 0`)
-— threaded explicitly from training config in `train_dlm.py`/`eval_only.py`/
-`eval_venn.py` rather than left as an independent CLI default, since a model trained
-with self-conditioning always zeroed never learned to use a nonzero self-conditioning
-input.
-
-### 6.7 GPTDecoder: standard causal decoder
-
-`arlm.GPTDecoder.forward` is an ordinary decoder-only transformer stack (causal
-self-attention via `DecoderLayer(causal=True)` + cross-attention to the same frozen
-context) producing token logits directly (no diffusion machinery). `arlm.loss` is
-standard teacher-forced next-token cross-entropy with `<PAD>` excluded via
-`ignore_index=tok.PAD` — unlike the DLM, the ARLM naturally learns to stop via `<EOS>`,
-so it never needs to learn to predict trailing `<PAD>`. This is also the source of the
-per-training-step `train/token_accuracy` scalar that only `train_arlm.py` logs (computed
-as a byproduct of `arlm.loss`'s teacher-forced logits, which `dlm.loss` has no equivalent
-of).
-
-`arlm.sample`: greedy (`argmax`) autoregressive decoding starting from `start_id`, one
-token at a time, stopping per-example at the first `eos_id` (tracked via a `finished`
-mask so already-finished examples in a batch get forced to emit `pad_id` rather than
-continuing to decode past their own stop token), or at `max_len` (defaults to `l_tgt`).
-No KV-cache — the full forward pass is recomputed every step; explicitly noted as
-negligible cost at this scale (2 layers, `d_model` 128-512, `l_tgt` up to ~55).
-`start_id`/`eos_id`/`pad_id` (and `loss`'s `pad_id`) default to `tok.P`/`tok.EOS`/
-`tok.PAD` (this project's own vocab, `--encoder_kind custom`); `train_arlm.py`/
-`eval_only.py`/`eval_venn.py` pass T5's own `pad_token_id`/`eos_token_id` instead when
-`--encoder_kind t5` (§6.5) — `arlm.py` needed this parameterization (unlike `dlm.py`,
-untouched by either T5 redesign) because the sampling loop bakes its stop condition
-directly into the generation logic, not just into the surrounding data pipeline.
-
-### 6.8 DLM optimizer: Muon + AdamW hybrid
-
-`train_dlm.py --optimizer muon` (the default) matches the canonical ELF implementation,
-which was checked directly against the paper (arXiv:2605.10938, Section 4: "Muon
-optimizer with learning rate 0.002") before wiring this in — see §11's note on which
-details the paper does and doesn't specify. `src/spelf/muon.py` implements Muon itself
-(`_newton_schulz5`: a fixed quintic Newton-Schulz iteration that approximately
-orthogonalizes a matrix in ~5 steps, run in bfloat16 for speed; `Muon`: Nesterov momentum
-→ orthogonalize the momentum-adjusted update → rescale by `max(1, rows/cols)**0.5` →
-decoupled weight decay). Muon's own usage convention (not specific to this codebase) is
-that it should only optimize a transformer's own ≥2D "hidden" weight matrices —
-embeddings, positional/mode embeddings, and any 1D parameter (biases, LayerNorm
-weight/bias) are conventionally left to AdamW instead, since Muon's orthogonalized-update
-semantics assume the parameter is a linear map between two continuous spaces, which
-doesn't fit an embedding table's per-row lookup semantics.
-
-`common._is_muon_eligible(name, p)` implements that split for this codebase's specific
-parameter names: `p.ndim < 2` → AdamW; name containing `"embedding"`, `"pos_emb"`,
-`"mode_emb"`, or `"null_context"` → AdamW (this is what excludes `SharedEmbedding`,
-`LearnedPosEnc.pos_emb`, `DLMDecoder.mode_emb`, and `DLMDecoder.null_context` — the last
-of these has `ndim=3`, shape `(1,1,d_model)`, so it isn't caught by the `ndim<2` rule
-alone and needs the explicit name exclusion); everything else (attention in/out
-projections, MLP linears, `DLMDecoder`'s own `input_proj`/`out_proj`) → Muon.
-`common.build_dlm_optimizer` applies this split via `trainable_parameters` (so a
-parameter shared across modules, e.g. the embedding table shared between encoder and
-decoder, is never double-assigned) and returns a `common.MultiOptimizer` wrapping both
-underlying optimizers — a small class that duck-types `torch.optim.Optimizer`'s
-`step`/`zero_grad`/`state_dict`/`load_state_dict` interface closely enough to drop into
-`save_checkpoint`/`load_checkpoint` completely unchanged. `common.build_multi_lr_schedule`
-does the same for a matching pair of `LambdaLR`s (`common.MultiScheduler`), both sharing
-the same warmup/cosine shape but each keyed to its own optimizer's own peak LR
-(`--muon_lr`, default 0.02 — an order of magnitude above typical AdamW LRs, matching
-Muon's own literature convention — vs. `--lr`, default 2e-4, for the AdamW group).
-
-`--optimizer adamw` is kept as an explicit fallback/ablation path — a single AdamW
-optimizer over every trainable DLM parameter, identical in shape to what
-`train_arlm.py`/`pretrain_encoder.py` already do (`common.build_optimizer`, untouched by
-this addition). Grad-clipping (`torch.nn.utils.clip_grad_norm_`) is unaffected by either
-choice — it already operates over the raw trainable-parameter list, independent of which
-optimizer(s) will consume the clipped gradients.
-
-## 7. Evaluation semantics
-
-Source: [`metrics.py`](src/spelf/metrics.py).
-
-`metrics.evaluate_generation(input_ids_row, gen_ids_row, target_ids_row)` computes, per
-example:
-
-| Metric | Definition | Notes |
-|---|---|---|
-| `token_accuracy` | elementwise match, generated vs. target, over the full `L_TGT` canvas | inflated by trivially-correct trailing `<PAD>` positions |
-| `token_accuracy_nopad` | elementwise match restricted to positions the **target** doesn't pad | masks by the target's own `<PAD>` span, not the generation's, so a generation that mispredicts *where* `<EOS>`/`<PAD>` starts is still penalized correctly |
-| `exact_match` | full-sequence equality with the one canonical target used in that example | a strict diagnostic — the model can find a *different*, equally valid, diametric path and score `optimal=True` while `exact_match=False` |
-| `valid` | decodes to a real simple path (no repeated nodes) using real edges of the reconstructed graph | prerequisite for `shortest`/`correct_length`/`optimal` — all three are `False` if this is `False` |
-| `shortest` | `valid` and the path is the actual shortest path between its own two endpoints | necessary but not sufficient for being diametric — the endpoints need not be a diametric pair |
-| `correct_length` | `valid` and the path's edge-length equals the graph's diameter | also not sufficient alone — a non-shortest walk between two close nodes could coincidentally have `diameter` edges |
-| `optimal` | `shortest` **and** `correct_length` | equivalent to "endpoints are a diametric pair and this is a shortest path between them" — exactly the definition of a genuine diametric path. This is the ID early-stopping signal in all three training scripts. |
-
-`shortest` and `correct_length` are both subsets of `valid` by construction (only ever
-set `True` when `valid` is `True`), and their intersection is exactly `optimal` — this
-is the structure `eval_venn.py` visualizes (§9.6).
-
-`metrics.run_eval(decoder, encoder, loader, device, sample_kwargs, max_batches)` is the
-one function both `.generate()`-exposing decoders share: it dispatches purely on
-`decoder.generate(context, context_mask, **sample_kwargs)`, so everything past that call
-is identical for DLM and ARLM. Called with `max_batches` set for the cheap subsampled
-per-`--eval_every` eval during training, and `max_batches=None` for full-dataset eval
-(`--full_eval_every`) and both standalone eval scripts.
-
-## 8. Training infrastructure
-
-Source: [`common.py`](src/spelf/common.py).
-
-- **Optimizer** (`build_optimizer`): AdamW with the conventional exclusion of
-  embeddings/LayerNorm/bias/1-D params (and `null_context`) from weight decay —
-  necessary, not cosmetic, for `SharedEmbedding.freeze_pretrained_rows` to behave as a
-  true freeze (§6.1). Accepts a single module or a list of modules
-  (`[decoder, t5_encoder]` when the conditioning encoder itself has trainable params);
-  `trainable_parameters` dedupes by parameter object identity so a param shared between
-  two modules (the embedding table, encoder ↔ decoder) is never double-listed,
-  double-clipped, or double-stepped.
-- **LR schedule** (`build_lr_schedule`): linear warmup → cosine decay to 0, as a
-  `LambdaLR` multiplier.
-- **Checkpointing** (`save_checkpoint`/`load_checkpoint`): each checkpoint bundles model
-  state, optimizer state, scheduler state, an arbitrary `extra_state` dict (early-stopper
-  state, wandb run id, T5-encoder trainable state when applicable), the run's own config
-  dict, and full RNG state (python/numpy/torch, plus CUDA/MPS if available) so a resumed
-  run's data order and dropout masks continue exactly where they left off, not just its
-  weights. Every run directory accumulates `checkpoint_latest.pt`, `checkpoint_best.pt`,
-  and (`also_snapshot=True`) a rolling window of `checkpoint_step_N.pt` files pruned to
-  the last `keep_last_k` (default 3) by `_prune_old_snapshots`.
-- **Resume safety** (`check_checkpoint_config`): asserts specific config keys (currently
-  just `encoder_kind`) match between a resumed checkpoint and the current CLI invocation
-  *before* attempting to load optimizer state — without this, resuming a `--run_dir` that
-  was trained with a different `--encoder_kind` would surface later as a cryptic
-  `optimizer.load_state_dict` "parameter group doesn't match" error, since the two
-  encoder kinds have disjoint trainable-parameter sets.
-- **Early stopping** (`EarlyStopper`): tracks a metric (ID `optimal_rate`, `mode="max"`
-  in every training script) across eval rounds; `step()` returns `True` once it has
-  failed to improve by more than `--tolerance` for `--patience` consecutive rounds.
-  Encoder pretraining does *not* use this — it has no path-label signal to early-stop on,
-  so it runs a fixed `--steps` budget instead, tracking held-out MLM loss purely for
-  "did I diverge" monitoring and best-checkpoint selection.
-- **wandb** (`wandb_init`): logs the full CLI config (plus derived fields like `l_in`/
-  `l_tgt`/`vocab_size`/`d_model`) under a shared `--wandb_group` so encoder/DLM/ARLM runs
-  are comparable side-by-side in the UI. Reattaches to a previous run via a saved
-  `run.id` (in `extra_state["wandb_run_id"]`) on resume, so a locally-resumed run
-  continues its existing history instead of forking a fresh, empty-looking run at the
-  same step.
-
-## 9. Scripts (command flow and I/O)
-
-| Script | Reads | Writes | Notes |
-|---|---|---|---|
-| [`generate_data.py`](scripts/generate_data.py) | nothing | `{out_dir}/{train,val_id,val_ood,encoder_pretrain_extra}.pt`, `{out_dir}/meta.json` | Run once per dataset config; everything downstream reads `meta.json` for shapes/vocab. |
-| [`pretrain_encoder.py`](scripts/pretrain_encoder.py) | `data/train.pt`, `data/encoder_pretrain_extra.pt`, `data/meta.json` (via `dataset.EncoderPretrainDataset`) | `runs/encoder/checkpoint_{latest,best,step_N}.pt` | Fixed `--steps` budget, no early stop (§8). A 10% (up to `--n_eval_holdout`) slice of the pretraining corpus is held out via `random_split` for eval-loss/accuracy tracking. |
-| [`train_dlm.py`](scripts/train_dlm.py) | `data/{train,val_id,val_ood}.pt`, `data/meta.json`, `--encoder_ckpt` (or a fresh T5 encoder if `--encoder_kind t5`) | `runs/dlm/checkpoint_{latest,best,step_N}.pt` | Trains `DLMDecoder`; early-stops on ID `optimal_rate`. |
-| [`train_arlm.py`](scripts/train_arlm.py) | same as `train_dlm.py` | `runs/arlm/checkpoint_{latest,best,step_N}.pt` | Same shape as `train_dlm.py`, no diffusion-specific args (§6.7). |
-| [`eval_only.py`](scripts/eval_only.py) | a trained checkpoint (`--checkpoint`), the encoder it references (`--encoder_ckpt` or the value baked into the checkpoint's own config), `data/val_{id,ood}.pt` | optional PNGs (`--save_viz_dir`), optional wandb log | Reconstructs the encoder+decoder purely from the checkpoint's saved config — no training-script CLI args need to be re-supplied by hand. |
-| [`eval_venn.py`](scripts/eval_venn.py) | same as `eval_only.py` | one PNG (`--out`, defaults to `venn_{model_kind}_{checkpoint_stem}.png`) | Same checkpoint-driven reconstruction pattern as `eval_only.py` (`load_encoder_from_checkpoint`/`build_decoder` duplicate that logic locally rather than importing it, since `eval_only.py` doesn't expose it as a reusable function). See §9.6 for the diagram's design. |
-| [`dataset_stats.py`](scripts/dataset_stats.py) | `data/{train,val_id,val_ood,encoder_pretrain_extra}.pt`, `data/meta.json` | one text report (`--out`, defaults to `{data_dir}/dataset_stats.txt`) | No model/checkpoint involved at all — pure dataset introspection. See §9.7. |
-| [`inspect_t5_tokenization.py`](scripts/inspect_t5_tokenization.py) | `data/{train,val_id,val_ood}.pt` (one split, `--split`), no checkpoint | one text report (`--out`, defaults to `{data_dir}/t5_tokenization_samples.txt`) | Also runs (and exits non-zero on failure) the automated node-id-token-boundary check described in §6.5/§9.8. |
-
-### 9.1–9.5 Training-script control flow (shared shape across `pretrain_encoder.py`/`train_dlm.py`/`train_arlm.py`)
-
-All three follow the same explicit (not abstracted into a shared `Trainer` class) loop
-shape, by design, so each script reads top-to-bottom on its own:
-
-1. Parse args → `common.set_seed` → `common.get_device`.
-2. Load `meta.json`, build datasets/loaders.
-3. Build model(s), optimizer, LR schedule, (for DLM/ARLM) `EarlyStopper`.
-4. If `--resume` resolves to an existing checkpoint: validate config compatibility
-   (`check_checkpoint_config`), load all state, recover `start_step`.
-5. `wandb_init`, reattaching to a previous run id if resumed.
-6. Infinite-loader training loop (`infinite_loader` just re-iterates the `DataLoader`
-   forever — no notion of "epoch" is tracked or logged anywhere in this codebase, only
-   `step`): forward → loss → backward → grad-clip → optimizer/scheduler step → periodic
-   console + wandb logging (`--log_every`) → periodic cheap eval (`--eval_every`) →
-   periodic full eval (`--full_eval_every`) → checkpoint save (best + latest, every cheap
-   eval round) → early-stop check (DLM/ARLM only).
-7. Final full eval + wandb image log, `run.finish()`.
-
-### 9.6 `eval_venn.py`'s Venn-diagram design
-
-Given the four-region structure from §7 (`shortest`/`correct_length` both subsets of
-`valid`, intersection = `optimal`), the diagram draws `shortest` and `correct_length` as
-two **fixed-size** overlapping circles (`_draw_venn`, radius `r=1.4`, center distance
-`d=1.4` — constants, not derived from the counts) enclosed in a larger dashed `valid`
-boundary, with the actual count and percentage of the split's total written as text in
-each of the four regions (`shortest`-only, `correct_length`-only, `optimal`, `valid`-only)
-plus `invalid` reported separately outside the boundary. This was a deliberate
-simplification over an earlier area-proportional version (circle sizes/overlap solved to
-match true counts via a closed-form circle-intersection-area formula): the proportional
-version produced illegible, near-zero-radius, overlapping labels whenever a checkpoint's
-counts were degenerate (e.g. an undertrained smoke-test model scoring near-zero on every
-metric), and exact areas add little when the same information is already printed as
-text. The uniform layout is schematic only — never read circle/overlap *size* as
-meaningful, only the text.
-
-### 9.7 `dataset_stats.py`'s per-example vs. per-unique-graph split
-
-Token-count statistics (`input_tokens`, `target_tokens`,
-`implied_diameter_from_target`) are computed **per example** — that's what actually
-varies example-to-example (padding, which diametric path was chosen) and what a
-model/dataloader actually sees. Graph-connectivity statistics (`n_nodes`, `n_edges`,
-`avg_degree`, `density`, `diameter`, `avg_shortest_path_length`) are computed **once per
-unique graph** — deduplicated by `graph_id` for the three labeled splits
-(`_unique_labeled_graphs`) or by `data_cache.graph_key(n, edges)` for the unlabeled
-`encoder_pretrain_extra` split, which has no `graph_id` field
-(`_unique_unlabeled_graphs`). Without this dedup, connectivity stats would be skewed
-toward whichever graphs happen to contribute more examples (more diametric paths, or
-more edge-shuffled copies) — see §5.5's `examples_per_graph`-vs-diameter correlation for
-why that skew is systematic, not noise. `implied_diameter_from_target` is a decode-free
-cross-check computed directly from `target_ids != PAD` counts (`target_len - 3 ==
-diameter`, since every labeled target is `<P>` + path_nodes + `<EOS>` and
-`len(path_nodes) - 1 == diameter` by construction) — it's example-weighted (like the
-token-count stats), so it's *expected* to differ slightly from the graph-weighted
-`diameter` connectivity stat, confirmed in `data/dataset_stats.txt` (train: 2.799 vs.
-3.074) and verified as a real weighting effect, not a bug, via a one-off script during
-development (0 mismatches between per-example implied diameter and the example's own
-graph's true `nx.diameter` across 2000 sampled examples).
-
-### 9.8 `inspect_t5_tokenization.py`'s automated boundary check
-
-For each sampled example's `graph_to_text`/`path_to_text` output, the script tokenizes
-with `return_offsets_mapping=True` (T5's fast tokenizer gives each token's character
-span in the source string) and separately regexes the source string for every node-id
-number's own character span (`\d+`). A check fails if any single token's span overlaps
-*two different* number spans — i.e. tokenization fused two distinct node ids into one
-token, exactly the failure mode `graph_to_text`/`path_to_text`'s spacing (§6.5) is
-designed to prevent. This is a genuine per-sample verification against the real
-tokenizer, not a static assumption — `tests/test_t5_encoder.py` includes a regression
-check confirming the *old* unspaced edge format (`"3-7"`, no surrounding spaces) really
-does fail this exact check for some inputs, so the check itself is known to be
-meaningful and not vacuously always-passing.
-
-## 10. Tunable variables (CLI arguments)
-
-Every `argparse` flag in the codebase, grouped by concern. Script column shows which
-script(s) expose the flag; where a flag exists in more than one script with the same
-name, its default may differ between them (noted inline).
-
-### Data generation (`generate_data.py`)
-
-| Flag | Default | Effect |
-|---|---|---|
-| `--seed` | 42 | Top-level seed; fans out into 4 independent per-split RNG streams (§5.7). |
-| `--out_dir` | `data` | Output directory for `.pt` files + `meta.json`. |
-| `--n_train_graphs` | 50000 | Number of distinct graphs sampled for `train.pt`. |
-| `--max_paths_per_graph` | 5 | Cap on diametric-pair examples per graph (labeled splits); exact edge-shuffle repeat count for the unlabeled corpus (§5.5). |
-| `--n_val_id_graphs` | 500 | Graphs in `val_id.pt`. |
-| `--n_val_ood_graphs` | 300 | Graphs in `val_ood.pt`. |
-| `--n_encoder_pretrain_ood_graphs` | 10000 | Graphs in `encoder_pretrain_extra.pt` (§5.6). |
-| `--avg_degree` | 3.0 | Target average node degree, drives the Erdős–Rényi edge probability (`graphgen._sample_graph_contiguous`). |
-
-### Architecture (shared shape across `pretrain_encoder.py`/`train_dlm.py`/`train_arlm.py`)
-
-| Flag | Default | Effect |
-|---|---|---|
-| `--d_model` | 128 | `pretrain_encoder.py` only. **Not present in `train_dlm.py` or `train_arlm.py`** — for both, `d_model` is always derived (from `--encoder_ckpt` in custom mode, from the T5 model's own `config.d_model` in t5 mode, §6.5), never a free choice, so there's nothing for a flag to override. |
-| `--n_layers` | 2 | Transformer layers (encoder or decoder, per script). |
-| `--n_heads` | 8 | Attention heads. |
-| `--d_mlp` | 512 | MLP hidden size. |
-| `--dropout` | 0.1 | Post-attention/MLP dropout (attention's own internal dropout is hardcoded to 0, §6.3). |
-
-### Conditioning encoder selection (`train_dlm.py`, `train_arlm.py`)
-
-| Flag | Default | Effect |
-|---|---|---|
-| `--encoder_kind` | `custom` | `custom` = this project's `GraphEncoder` (`--encoder_ckpt` required), decoder targets this project's own vocab. `t5` = frozen pretrained T5 conditions AND the decoder targets T5's own vocab/embedding space instead — `T5GraphEncoder` for `train_arlm.py`, `T5DiffusionEncoder` for `train_dlm.py` (§6.5). |
-| `--encoder_ckpt` | `None` | Path to a `pretrain_encoder.py` checkpoint; required iff `--encoder_kind custom`. |
-| `--t5_model_name` | `t5-small` | HuggingFace T5 checkpoint name; used iff `--encoder_kind t5`. |
-
-### Optimization (all four training-capable scripts: `pretrain_encoder.py`, `train_dlm.py`, `train_arlm.py`; `eval_*.py` don't train)
-
-| Flag | Default (`pretrain_encoder.py` / `train_dlm.py` / `train_arlm.py`) | Effect |
-|---|---|---|
-| `--seed` | 0 / 0 / 0 | Seeds `common.set_seed` for this run (independent of the data-generation seed). |
-| `--lr` | 3e-4 / 2e-4 / 3e-4 | AdamW learning rate. DLM's default is lower — noted in-code as wanting more training stability for the diffusion objective. |
-| `--warmup_steps` | 1000 / 2000 / 1000 | Linear-warmup length before cosine decay begins. |
-| `--weight_decay` | 0.01 / 0.01 / 0.01 | AdamW weight decay (excluded for embeddings/norms/bias, §8). |
-| `--grad_clip` | 1.0 / 1.0 / 1.0 | Global-norm gradient clipping threshold. |
-| `--batch_size` | 256 / 128 / 128 | Training batch size. |
-| `--steps` (encoder) / `--max_steps` (DLM/ARLM) | 30000 / 150000 / 100000 | Total step budget (encoder: hard budget; DLM/ARLM: budget or early stop, whichever first). |
-
-### Early stopping (`train_dlm.py`, `train_arlm.py` only — encoder pretraining has no label signal to stop on, §8)
-
-| Flag | Default | Effect |
-|---|---|---|
-| `--patience` | 5 | Consecutive non-improving eval rounds tolerated before stopping. |
-| `--tolerance` | 0.005 | Minimum ID `optimal_rate` improvement to reset the patience counter. |
-
-### DLM optimizer (`train_dlm.py` only, §6.8)
-
-| Flag | Default | Effect |
-|---|---|---|
-| `--optimizer` | `muon` | `muon` = canonical-ELF-matching Muon+AdamW hybrid; `adamw` = single AdamW optimizer over everything (same shape as `train_arlm.py`/`pretrain_encoder.py`). |
-| `--muon_lr` | 0.02 | Peak LR for the Muon param group (only used when `--optimizer muon`); the paper reports 0.002 — pass that explicitly to match it exactly. |
-| `--muon_momentum` | 0.95 | Muon's Nesterov momentum coefficient. |
-| `--muon_weight_decay` | 0.0 | Decoupled weight decay on the Muon param group, independent of `--weight_decay` (which still governs the AdamW group in both `--optimizer` modes). |
-
-### DLM-specific (`train_dlm.py`, plus a read-only echo in `eval_only.py`/`eval_venn.py` via the checkpoint's saved config)
-
-| Flag | Default | Effect |
-|---|---|---|
-| `--cfg_dropout` | 0.1 | Per-example probability of replacing context with `null_context` during training (§6.6 step 1). |
-| `--decode_branch_prob` | 0.2 | Fraction of each batch routed to the near-clean cross-entropy branch instead of the noisy-MSE branch. |
-| `--selfcond_prob` | 0.0 | Probability of using a real (detached) self-conditioning input instead of zeros; 0.0 = vanilla (no self-conditioning at train *or* sample time, since `eval_only.py`/`eval_venn.py`/`train_dlm.py`'s own `sample_kwargs` all derive `use_self_cond` from this). |
-| `--lambda_ce` | 1.0 | Weight on the decode-branch cross-entropy term relative to the denoise-branch MSE term in the total loss. |
-| `--num_sample_steps` | 32 | Euler-integration steps at sampling/inference time (also exposed identically in `eval_only.py`/`eval_venn.py`). |
-| `--guidance_scale` | 1.0 | Classifier-free-guidance strength at sampling time; 1.0 disables CFG entirely (also in `eval_only.py`/`eval_venn.py`). |
-
-### Encoder pretraining objective (`pretrain_encoder.py`)
-
-| Flag | Default | Effect |
-|---|---|---|
-| `--mlm_prob` | 0.15 | Fraction of eligible (node-id) token positions masked per example. |
-| `--n_eval_holdout` | 2000 | Size of the held-out slice of the pretraining corpus used for eval loss/accuracy (capped at 10% of the corpus). |
-
-### Eval cadence & subsampling (`train_dlm.py`, `train_arlm.py`)
-
-| Flag | Default | Effect |
-|---|---|---|
-| `--log_every` | 100 | Console + wandb scalar logging interval (steps). |
-| `--eval_every` | 1000 | Cheap subsampled ID+OOD eval interval; drives early-stop checks and `checkpoint_latest`/`checkpoint_best` saves. |
-| `--full_eval_every` | 5000 | Full (unsubsampled) ID+OOD eval interval. |
-| `--n_id_subsample` | 500 | Approx. example count used for the cheap eval's ID subset (converted to a batch count). |
-| `--n_ood_subsample` | 300 | Same, OOD. |
-| `--n_viz_examples` | 4 (training scripts) / 8 (`eval_only.py`) | Number of example plots logged to wandb (and/or saved, `eval_only.py`) per eval round. |
-
-### Run management (every script that trains or evaluates)
-
-| Flag | Default | Effect |
-|---|---|---|
-| `--data_dir` | `data` | Where to read cached `.pt`/`meta.json` from. |
-| `--run_dir` | script-specific (`runs/encoder`, `runs/dlm`, `runs/arlm`) | Checkpoint directory. |
-| `--resume` | `latest` | `latest` \| `best` \| an explicit path \| `none` (fresh start); resolved by `common.resolve_checkpoint_path`. |
-| `--num_workers` | 0 | `DataLoader` worker count. |
-| `--wandb_project` | `shortest-path-elf` | wandb project name. |
-| `--wandb_run_name` | script-specific | wandb run display name. |
-| `--wandb_group` | `graph-shortest-path` | Groups encoder/DLM/ARLM runs together in the wandb UI. |
-| `--wandb_mode` | `online` (training scripts) / `disabled` (`eval_only.py`) | `online` \| `offline` \| `disabled`. |
-
-### Standalone eval (`eval_only.py`, `eval_venn.py`)
-
-| Flag | Default | Effect |
-|---|---|---|
-| `--checkpoint` | *(required)* | Path to a trained DLM/ARLM checkpoint. |
-| `--model_kind` | *(required)* | `dlm` \| `arlm` — must match the checkpoint. |
-| `--encoder_ckpt` | `None` | Overrides the encoder path baked into the checkpoint's own config, if set. |
-| `--split` | `both` | (`eval_only.py` only) `id` \| `ood` \| `both`. `eval_venn.py` always does both, side by side. |
-| `--batch_size` | 128 | Eval batch size. |
-| `--save_viz_dir` | `None` | (`eval_only.py` only) also save example plots as local PNGs. |
-| `--out` | `venn_{model_kind}_{checkpoint_stem}.png` | (`eval_venn.py` only) output image path. |
-
-### Dataset statistics (`dataset_stats.py`)
-
-| Flag | Default | Effect |
-|---|---|---|
-| `--data_dir` | `data` | Dataset directory to analyze. |
-| `--out` | `{data_dir}/dataset_stats.txt` | Report output path. |
-
-### T5 tokenization inspection (`inspect_t5_tokenization.py`)
-
-| Flag | Default | Effect |
-|---|---|---|
-| `--data_dir` | `data` | Dataset directory to read the chosen split from. |
-| `--split` | `val_id` | `train` \| `val_id` \| `val_ood`. |
-| `--t5_model_name` | `t5-small` | Which T5 tokenizer to inspect against. |
-| `--n_samples` | 20 | Examples sampled (without replacement) for the report. |
-| `--seed` | 0 | Sampling seed. |
-| `--out` | `{data_dir}/t5_tokenization_samples.txt` | Report output path. |
-
-## 11. Non-tunable variables (hardcoded constants)
-
-These are not exposed as CLI flags; changing them means editing source, and several have
-correctness implications elsewhere in the codebase if changed carelessly.
-
-| Constant | Value | File | Why fixed |
-|---|---|---|---|
-| `MAX_NODES` | 14 | `tokenizer.py` | Largest OOD graph size; fixes the shared ID/OOD vocabulary (§4). Changing it requires regenerating all data and retraining, since `VOCAB_SIZE`/`TARGET_LENGTH` derive from it. |
-| `PAD,G,E,N,P,EOS,MASK` | `range(7)` | `tokenizer.py` | Fixed special-token id assignment; baked into every cached tensor on disk. |
-| `NODE_OFFSET` | 7 | `tokenizer.py` | First node-id token id; node token `k` is `NODE_OFFSET + k`. |
-| `VOCAB_SIZE` | `NODE_OFFSET + MAX_NODES` = 21 | `tokenizer.py` | Derived, not independently settable. |
-| `TARGET_LENGTH` | `MAX_NODES + 2` = 16 | `tokenizer.py` | Global fixed diffusion-canvas length (§4) — must be one constant across every graph size for the DLM's fixed-shape tensors. |
-| `ID_NODE_RANGE` | `(6, 10)` | `data_cache.py` | In-distribution graph size range; not exposed via CLI (unlike `--avg_degree` etc.) since the whole ID/OOD split design assumes exactly this boundary. |
-| `OOD_NODE_RANGE` | `(11, 14)` | `data_cache.py` | Out-of-distribution graph size range; upper bound must equal `MAX_NODES`. |
-| `SEED_OFFSETS` | `{train:0, val_id:1e6, val_ood:2e6, encoder_pretrain_extra:3e6}` | `data_cache.py` | Per-split RNG-stream independence under one top-level `--seed` (§5.7). |
-| graph_id offset scheme | train starts at 0; val_id at `10**9`; val_ood at `2*10**9` | `data_cache.generate_all` | Keeps `graph_id` numerically disjoint across splits; not otherwise meaningful. |
-| `DENOISE_MODE` / `DECODE_MODE` | 0 / 1 | `dlm.py` | Learned mode-embedding indices distinguishing the DLM's two training branches (§6.6). |
-| Attention dropout | `0.0` (always, regardless of `--dropout`) | `modules.py` (`EncoderLayer`, `DecoderLayer`) | MPS backend does not support `dropout_p>0` in `nn.MultiheadAttention`'s fast path during training (§6.3) — a platform limitation, not a tuning choice. |
-| Embedding init std | 0.02 | `modules.SharedEmbedding.__init__` | Conventional small-std init to keep unembedding logits well-scaled from the start (§6.1). |
-| Frozen-row exceptions | `(tok.P, tok.EOS)` | `modules.SharedEmbedding.freeze_pretrained_rows` default arg | The only two vocab tokens absent from the encoder's own input space (§6.1); every call site in this codebase uses the default. |
-| MLM-maskable tokens | node-id tokens only (`MASKABLE_TOKENS_ONLY_NODES = True`, documentation flag) | `encoder.py` | Structural markers (`<G>/<E>/<N>`) are never masked (§6.4). |
-| `eval_venn.py` circle geometry | `r=1.4`, `d=1.4` | `scripts/eval_venn.py` | Purely schematic layout constants, deliberately not derived from data (§9.6). |
-| `viz.py` node sizes/colors | `node_size=300/400`; blue=path, green=start, orange=end, red=invalid | `viz.py` | Cosmetic, not configurable via CLI. |
-| `keep_last_k` (checkpoint snapshot pruning) | 3 | `common.save_checkpoint` default arg | Not exposed via any script's CLI; every call site uses the default. |
-| optimizer no-decay rule | param `ndim<=1` or name contains `"embedding"`/`"norm"`/`"null_context"` | `common.build_optimizer` | Fixed heuristic, not parameterized. |
-| `l_tgt_t5` safety margin | `margin=8` | `t5_encoder.compute_l_tgt_t5` default arg | Headroom beyond the analytically-derived worst-case T5-token length (§6.5); not exposed via any script's CLI. |
-| `T5DiffusionEncoder`/`T5GraphEncoder` `max_text_len` | 256 | `t5_encoder.py` constructor default | Truncation cap for T5-tokenized graph-description text; not exposed via CLI — large relative to any real serialized graph in this dataset (§5's largest `l_in` is 124 project-vocab tokens). |
-
-## 12. Checkpoint schema
-
-Every checkpoint written by `common.save_checkpoint` (encoder, DLM, or ARLM alike) is a
-single `torch.save`d dict:
-
-```python
-{
-  "step": int,
-  "model_state": <model.state_dict()>,
-  "optimizer_state": <optimizer.state_dict() or None>,
-      # for DLM checkpoints with --optimizer muon (the default): {"muon": ..., "adamw": ...}
-      # (common.MultiOptimizer.state_dict(), see §6.8) rather than a single optimizer's
-      # state dict -- MultiOptimizer/MultiScheduler duck-type enough of
-      # torch.optim.Optimizer's interface that save_checkpoint/load_checkpoint don't
-      # need to know the difference.
-  "scheduler_state": <scheduler.state_dict() or None>,
-  "extra_state": {
-      # encoder: {"best_eval_loss": float | None, "wandb_run_id": str}
-      # DLM/ARLM: {"early_stopper": EarlyStopper.state_dict(), "wandb_run_id": str,
-      #            "encoder_trainable": {...} }  # only present if --encoder_kind t5
-  },
-  "config": <vars(args) | derived fields (l_in, l_tgt, vocab_size, d_model, ...)>,
-  "rng_state": {"python": ..., "numpy": ..., "torch": ..., "torch_cuda"?: ..., "torch_mps"?: ...},
-}
-```
-
-`config` is what makes `eval_only.py`/`eval_venn.py` able to reconstruct a matching
-encoder+decoder from nothing but `--checkpoint` — every architecture/`encoder_kind`
-field they need is read back from here rather than re-supplied on the eval CLI.
-`common.check_checkpoint_config` guards `--resume` against attaching to a checkpoint
-whose `config` disagrees on `encoder_kind` with the current invocation (§8).
-
-## 13. Testing
-
-[`tests/`](tests) covers the deterministic, non-model-training parts of the pipeline
-(nothing here trains a model — that's checked by hand via wandb curves, per the
-project's original plan):
-
-- `test_tokenizer_roundtrip.py` — `encode_input`/`decode_input`,
-  `encode_target`/`decode_target` round-trip identity (including the exact example from
-  `data_sample.txt`), padding behavior, and that malformed sequences decode to `None`
-  rather than raising.
-- `test_bfs_tiebreak.py` — `shortest_path_lexsmallest` against hand-worked small graphs,
-  including cases specifically constructed to distinguish "any valid shortest path" from
-  "the lexicographically smallest one" (§5.2).
-- `test_graphgen_connected.py` — `sample_graph` always returns a connected graph across
-  both the ID and OOD size ranges, average degree lands near the target, `diametric_pairs`
-  correctly enumerates ties, `sample_diametric_paths` respects its cap, and the
-  spanning-tree fallback (`_random_spanning_tree_fallback`) is itself always connected.
-- `test_label_pool.py` — the wide node-label pool (§5.3): labels are drawn from the full
-  pool (not just `0..n-1`), `label_pool_size < n` is rejected, default (no pool) behavior
-  is unchanged, and ID-sized training graphs really do exercise high node-id tokens
-  (directly exercises `assert_full_node_id_coverage`).
-- `test_muon.py` — the Muon optimizer and its DLM-specific parameter split (§6.8):
-  `_newton_schulz5` meaningfully orthogonalizes relative to the untouched raw input
-  (not a monotonic-in-steps check — verified empirically that this particular
-  fixed-coefficient bf16 iteration plateaus/oscillates past ~2 steps rather than
-  continuing to converge); `Muon` rejects 1D parameters at construction and reduces
-  loss on a toy regression; `common._is_muon_eligible`'s exact routing rules (a real
-  hidden weight matrix in, every embedding/`null_context` out); `common.build_dlm_optimizer`
-  partitions a real (tiny) `DLMDecoder`+`GraphEncoder`'s trainable parameters with no
-  double-assignment and no missing parameter; `MultiOptimizer`/`MultiScheduler`
-  state-dict round-tripping and shared warmup/cosine shape across both underlying
-  optimizers.
-- `test_t5_encoder.py` — the T5-diffusion machinery (§6.5), run against the real T5
-  tokenizer/embedding table (not mocked): `graph_to_text`/`path_to_text` never let a
-  node-id number share a token with a different one (checked via the tokenizer's own
-  offset mapping), including a regression check confirming the *old* unspaced format
-  really does fail this for some inputs (so the check is known to be meaningful, not
-  vacuous); `decode_t5_path_text`/`decode_t5_path_ids` round-trip real tokenizations,
-  reject genuinely malformed input, and — mirroring `tokenizer.decode_target`'s own
-  relaxation (§4/§6.6) — tolerate (truncate, don't reject) content after `<EOS>`;
-  `compute_l_tgt_t5`'s worst-case bound holds against 50 random paths;
-  `T5TiedEmbedding` is a parameter-free view onto T5's own embedding table;
-  `T5DiffusionEncoder` has zero trainable parameters; `T5SpaceDecoderAdapter`
-  round-trips a well-formed generation back to the correct path for both
-  `drop_first_token` settings (and correctly *fails* to recover the path when
-  `drop_first_token` is wrongly left `False` against an ARLM-shaped generation, which is
-  what confirms the flag is actually doing something) and never crashes on garbage
-  input; `UntiedEmbedding`'s embed/unembed are genuinely independent (different weight
-  tensors, and gradient through `unembed` never reaches `tok_embedding`);
-  `T5GraphEncoder` has no `proj` attribute, derives `d_model` from T5's own config, has
-  an `UntiedEmbedding` sized to `len(t5_tokenizer)`, and its only trainable parameters
-  are exactly that embedding's three (`tok_embedding.weight`, `lm_head.weight`,
-  `lm_head.bias`) — nothing from T5 itself leaks through;
-  `T5GraphEncoder.tokenize_path_targets` prepends T5's own `pad_token_id` and pads to
-  `l_tgt_t5`, and the result round-trips back to the original path via
-  `decode_t5_path_ids` once that prefix is dropped; `arlm.sample`/`arlm.loss` accept
-  custom `start_id`/`eos_id`/`pad_id` while still defaulting to this project's own
-  `tok.P`/`tok.EOS`/`tok.PAD` for backward compatibility.
-- `test_dlm.py` — `dlm.loss`'s pad-exclusion masking (§6.6), for both loss terms: the
-  exact `ignore_index`-plus-per-example-real-count arithmetic matches a hand-computed
-  reference (including a degenerate all-`<PAD>` row); a real (tiny) `DLMDecoder`'s
-  `decode_loss` *and* separately its `denoise_loss` each genuinely differ between the
-  default `pad_id` (matching the target's real `<PAD>` marker) and a `pad_id` that
-  never appears in the target (nothing masked), proving the masking has an actual
-  effect on both branches rather than being a no-op; an all-`<PAD>` target produces a
-  finite (not NaN/Inf) loss for both branches.
-- `test_tokenizer_roundtrip.py` also covers `decode_target`'s relaxed handling of
-  content after `<EOS>` (truncated, not rejected — §4/§6.6), alongside its existing
-  round-trip and malformed-input coverage.
-
-Run with `pytest tests/ -q` from the repo root (after `pip install -r requirements.txt`).
-`test_t5_encoder.py` downloads/loads a real `t5-small` tokenizer and encoder model on
-first use (via `transformers`) — the only test file in this suite that does real network
-I/O (or reads from the local HuggingFace cache) rather than running purely offline.
+The encoder is a real pretrained T5 (Section 4), so tokenization uses T5's
+own vocabulary -- `transformers.T5TokenizerFast.from_pretrained("t5-small")`
+-- rather than a bespoke one. Grammar keywords are lowercase (`nodes:`,
+`edges:`, `find diametric path`) so common words tokenize as single pieces
+under T5's SentencePiece vocab (e.g. `"▁edges"`, `"▁find"`) instead of
+splitting the way their uppercase forms do; domain-specific words like
+"diametric" still split into several subword pieces regardless of case
+(`"▁di|a|metric"`), which is expected and harmless.
+
+**Keeping node ids separate.** Every node id is single-space-delimited from
+its neighbors on both sides -- as its own entry in the node list, and as the
+two space-separated operands of `-` in each edge (`u - v`, never `u-v`).
+Under a SentencePiece tokenizer, leading whitespace is *part of* a token
+(`" 12"` -> `"▁12"`), so this spacing is what actually keeps adjacent node
+ids from merging into one token or bleeding into each other:
+`tokenizer("11 12")` -> `["▁11", "▁12"]`, two clean tokens, never
+`["▁1112"]` or any token mixing digits from both. `scripts/
+inspect_t5_tokenization.py` prints exactly this (`|` between tokens) for a
+handful of examples and saves them to `data_sample.txt`;
+`tests/test_tokenizer_roundtrip.py::test_adjacent_multi_digit_node_ids_stay_separate_tokens`
+checks it holds for every node-id width (1 and 2 digits) programmatically.
+One real quirk visible in that sample file: `"0"` specifically tokenizes as
+two pieces (`"▁"` + `"0"`) rather than one, unlike other single digits --
+harmless (decoding still reconstructs the exact original text), just a
+reminder that "one token per id" isn't universally true even though ids stay
+cleanly separated from each other.
+
+Both condition and target are tokenized with `add_special_tokens=False`
+(ELF's own minimal data-prep recipe), and an explicit EOS is appended to the
+target afterward, since the model needs a learnable stopping signal at
+generation time (`sampling.mask_after_eos` truncates each decoded sequence
+at its first predicted EOS). The same tokenizer instance is used for the
+condition (fed to the encoder) and the target (the CE decoder head's output
+space over the *full* T5 vocabulary, ~32k tokens) -- matching ELF's own
+setup, where encoder and decoder always share one vocabulary.
+
+Batching (`make_collate_fn`) concatenates condition + target ids into one
+`max_length`-padded sequence and derives three masks, matching ELF's
+`data_utils.py` exactly: `cond_seq_mask` (1 at condition positions),
+`attention_mask` (1 at any valid, non-pad position -- also the loss mask),
+and `encoder_attention_mask` (condition tokens attend only to condition
+tokens; target tokens attend to everything valid). That last mask is what
+the frozen T5 encoder actually sees (Section 4) -- and it's run over the
+*whole* concatenated sequence, condition and target together, which is the
+detail that makes the next section make sense. `max_input_length=240` /
+`max_length=264` are sized with margin above the worst case at
+`max_edges=46`, `ood_max_nodes=14` (~222 condition tokens, ~16 target
+tokens under T5's tokenizer -- see the largest example in `data_sample.txt`).
+
+## 4. Encoder: a real pretrained, frozen T5
+
+A subtlety worth stating explicitly, because it's easy to misread ELF's
+`train_step.py`: the frozen T5 encoder is not merely a "read the prompt"
+module. It's called once per training step over the *entire* concatenated
+(condition + target) sequence, using `encoder_attention_mask` above. Its
+output over the condition region becomes the pinned conditioning embeddings
+(`cond_seq`); its output over the *target* region becomes `x0`, the clean
+latent that the diffusion process is trained to denoise toward, and that the
+CE decoder head is trained to reconstruct as discrete tokens. The encoder
+thus defines the entire continuous embedding space the diffusion model
+operates in, for both halves of the sequence.
+
+**This is a real pretrained T5, not a custom one.** An earlier version of
+this project pretrained its own small T5 from scratch (span corruption on
+this project's own data) because it started from a closed, bespoke
+vocabulary with no pretrained checkpoint to match. Once the tokenizer became
+T5's own real vocabulary (Section 3), there both *is* a matching pretrained
+checkpoint and no reason not to use it -- `transformers.T5EncoderModel.
+from_pretrained("t5-small")`, frozen, exactly the call ELF's own `modules/
+t5_encoder.py` makes (`spelf/t5_encoder.py::build_pretrained_encoder`). No
+training happens here at all; weights are downloaded/cached by
+`transformers` on first use, identically to real ELF.
+
+**Latent normalization.** `encode_text` normalizes encoder outputs by
+`(x - latent_mean) / latent_std`, matching ELF's `encoder_utils.encode_text`.
+Since there's no local pretraining step to compute these as a byproduct of
+anymore, `scripts/prepare_encoder.py` computes them directly: it runs the
+frozen encoder over the *actual training collate pipeline*
+(`PathDataset`/`get_dataloader`, the same concatenated condition+target
+sequences and `encoder_attention_mask` that `train_step.py` will really use,
+not condition text in isolation) for up to `latent_stats_sample_size`
+examples, and takes the scalar mean/std of its outputs at valid positions.
+These, plus which encoder/tokenizer names were used, are cached to
+`config.encoder_profile_path` as a small JSON file -- not a weights
+checkpoint, since the weights are just re-downloaded via `from_pretrained`
+every run. `train.py`/`eval.py` read the profile back out and verify
+`encoder_model_name` still matches the current config before trusting its
+stats.
+
+**Sizing.** `t5-small`: `d_model=512`, 6 encoder layers, ~35M frozen
+parameters -- ELF's own default encoder. Since the diffusion backbone itself
+is tiny (Section 5), most of the *trainable* ELF-XS model's parameters
+aren't in the backbone at all but in the pieces sized off the encoder's
+`d_model=512` and the ~32k-token vocabulary -- `bottleneck_dim`'s text
+projection and especially `unembed_kernel` (`hidden_size x vocab`) -- the
+same proportion real ELF-B has relative to its own T5 encoder and vocabulary.
+
+## 5. Model: the ELF diffusion transformer (`spelf/dlm.py`, `spelf/modules.py`)
+
+Ported block-for-block from ELF's `pytorch_elf` branch (`modules/model.py`,
+`modules/layers.py`): pre-norm transformer blocks (RMSNorm -> QK-normed
+multi-head attention with 1D RoPE -> RMSNorm -> SwiGLU FFN), learned prefix
+tokens carrying time / self-cond-cfg / model-mode conditioning (prepended to
+the sequence, RoPE-exempt via `num_empty_token`), a zero-initialized final
+flow-matching output head, and a factored CE decoder head
+(`hidden -> text_encoder_dim -> vocab`, sharing the backbone with the flow
+head). The one dependency dropped is `einops` (`modules.py`'s `rotate_half`
+and RoPE frequency doubling are each a one-line `reshape`/`repeat_interleave`
+without it).
+
+**A load-bearing contract, not obvious from the reference:** the RoPE
+table's prefix budget (`num_empty_token`) is fixed at construction time from
+`num_model_mode_tokens + num_time_tokens + num_self_cond_cfg_tokens`. Every
+forward call must therefore supply *exactly* `max_length` non-prefix
+positions, and if the model was built with `num_self_cond_cfg_tokens > 0`,
+every call must pass `self_cond_cfg_scale` (never `None`) -- omitting it
+prepends a shorter prefix than the RoPE table expects and produces a shape
+mismatch several layers deep. `dlm.py` raises a clear `ValueError` for the
+second case instead of letting it surface as a confusing RoPE broadcast
+error (`tests/test_dlm.py::test_forward_requires_self_cond_cfg_scale_when_configured`
+covers this). Every real call site (`train_step.py`, `sampling.py`) already
+satisfies both halves of this contract, since batches are always padded to
+`config.max_length` and `self_cond_cfg_scale` is computed unconditionally
+whenever `num_self_cond_cfg_tokens > 0`.
+
+**Model sizing.** ELF-B/M/L (105M/342M/652M params) target document-length
+English text; the T5 vocabulary here is the same one ELF-B uses
+(`t5-small`, ~32k tokens, Section 4), but this task's sequences are far
+shorter (<=~264 positions vs. document-length OWT) -- so `ELF_models`
+defines much smaller *backbone* presets instead:
+
+| name | depth | hidden | heads | (ELF-B for reference) |
+|---|---|---|---|---|
+| `ELF-XS` (default) | 4 | 128 | 4 | depth 12, hidden 768, heads 12 |
+| `ELF-S` | 6 | 192 | 6 | |
+| `ELF-M` | 8 | 256 | 8 | |
+
+`ELF-XS` at the default config is ~18M parameters total -- but, per
+Section 4's sizing note, the vast majority of that is the vocabulary-sized
+`unembed_kernel`, not the backbone itself; the backbone is fast enough to
+iterate on CPU/MPS, which is the point.
+
+## 6. Training objective (`spelf/train_step.py`, `spelf/sampling.py`)
+
+One forward pass per step computes both heads on a mixed input; each
+example in the batch independently draws **decoder** (CE) or **denoiser**
+(L2) mode via a per-example Bernoulli at `decoder_prob` (default 0.5), and
+the two losses are masked to their respective rows and combined with a
+single shared denominator. This means every step trains both heads
+(smoother gradients than alternating whole-batch mode), matching ELF's own
+`train_step.py` exactly:
+
+- **Denoiser (L2) branch**: flow-matching. `t ~ logit-normal` (or uniform);
+  `z = t*x0 + (1-t)*noise`; target `v = (x0 - z) / clamp(1-t, t_eps)`; loss
+  is `(v_pred - v_target)^2`. Condition positions are pinned to their clean
+  embedding throughout (never noised, never predicted).
+- **Decoder (CE) branch**: the input is a *separately* logit-normal-noised
+  latent (`decoder_z`, always evaluated at `t=1` so the backbone knows it's
+  in "decode" mode) and the loss is per-token cross-entropy against the true
+  token id, from the factored decoder head.
+- **Self-conditioning**: with probability `self_cond_prob` (default 0.5),
+  the model additionally sees its own (no-grad) prediction of `x0` from a
+  shared unconditional forward pass, concatenated as a second half of the
+  input channel dimension -- this is why the model accepts inputs of width
+  `C` or `2C`.
+- **Self-cond-CFG guidance target**: when `num_self_cond_cfg_tokens > 0`
+  (default on), the L2 target is further adjusted by a guidance term
+  `(1 - 1/w) * (v_cond - v_uncond)` for a randomly sampled guidance strength
+  `w` (log-uniform in `[1+self_cond_cfg_min, 1+self_cond_cfg_max]`) -- this
+  trains the backbone to internalize a *range* of guidance strengths, so a
+  single trained model supports classifier-free-guidance-style sampling at
+  an arbitrary strength chosen at inference time (`config.self_cond_cfg_scale`).
+- **Classifier-free guidance (label dropping)**: with probability
+  `label_drop_prob` (default 0.1, nonzero unlike ELF's base default, so CFG
+  sampling is actually meaningful for this always-conditional task), the
+  condition is masked from the target's view *before* encoding, so the
+  target's latent for dropped examples is genuinely unconditional -- what
+  makes `cfg_scale > 1` sampling extrapolation valid.
+
+Optimizer: Muon by default (Section 7); gradient clipping at global norm 1.0;
+EMA of trainable parameters (`ema_decay1`, default 0.999) is what periodic
+eval and `scripts/eval.py` actually evaluate (`_build_eval_model` loads the
+EMA weights into an eval-mode copy), since EMA weights are standard practice
+for evaluating diffusion models and is what ELF does too.
+
+### Sampling (`spelf/sampling.py`)
+
+Flow-matching ODE (deterministic Euler) or SDE (stochastic, `sde_gamma`
+churn) rollout from Gaussian noise to a final latent, with condition
+positions restored to their pinned embedding after every step; the *last*
+step is always a plain ODE step regardless of `sampling_method`, matching
+ELF. Self-conditioning and CFG at sampling time reuse the exact same
+guided-forward machinery as training (`_forward_sample_self_cond`,
+`_forward_sample`). The final latent is decoded to tokens by one extra
+forward pass with `decoder_step_active=True` and `t=1` (`decode_batch`),
+argmax over the CE head; `mask_after_eos` then truncates each sequence at
+its first predicted EOS.
+
+## 7. Optimizer: Muon (`spelf/muon.py`)
+
+A from-scratch, single-device PyTorch implementation of Muon (2D parameters
+get Newton-Schulz-orthogonalized momentum updates; everything else gets
+bias-corrected Nesterov-Adam), rather than a port of ELF's
+`utils/muon_utils.py`. That file wraps and monkey-patches an external `muon`
+PyPI package plus `torch.distributed` all-gather logic for multi-host
+training; this project runs single-device, so that machinery would be
+dead weight and an external dependency to keep in sync. The algorithmic
+core is preserved: 5-step quintic Newton-Schulz orthogonalization in fp32,
+Nesterov momentum with bias correction, and `sqrt(max(1, fan_out/fan_in))`
+shape-scaling of the update. That last detail matters here specifically:
+`dlm.py`'s `proj_kernel`/`unembed_kernel` are bare 2D `nn.Parameter`s stored
+`(in, out)` (so `x @ proj_kernel` works), the opposite convention from
+`nn.Linear.weight`'s `(out, in)` -- `muon_with_aux_adam` detects which
+convention each 2D parameter follows (by checking whether it *is* some
+module's `nn.Linear.weight`) and flips the fan-in/fan-out ratio accordingly,
+so the shape-scaling is correct for both layouts. `AdamW` is available as a
+config alternative (`optimizer: adamw`) for comparison.
+
+Note on Newton-Schulz orthogonalization: the quintic iteration used here is
+tuned to pull singular values *toward* 1 within a handful of steps (Muon
+uses 5); it is not an algorithm that converges to exact orthogonality as
+`steps -> inf` the way a Newton iteration for the matrix sign function
+would. `tests/test_muon.py` tests the properties that actually hold --
+finite/shape-preserving output, singular-vector preservation (the update is
+a matrix polynomial in `X X^T` applied to `X`, so it can only rescale
+singular values, never rotate singular vectors), and that badly-scaled
+singular values move toward 1 -- rather than asserting near-perfect
+orthogonality, which the algorithm doesn't actually guarantee at this step
+count.
+
+## 8. Evaluation (`spelf/metrics.py`, `spelf/viz.py`)
+
+Both `scripts/train.py` (every `eval_freq` epochs) and `scripts/eval.py`
+(standalone, given a checkpoint) run the identical pipeline over the ID
+(`id_val.jsonl`) and OOD (`ood_test.jsonl`) splits: generate via the full
+sampler, decode to text (`tokenizer.decode(..., skip_special_tokens=True)`),
+parse back into a candidate path (`dataset.parse_path_text` -- returns
+`None`, not a best-effort partial parse, if any whitespace-separated piece
+of the decoded body isn't a bare node-id, since a stray word or punctuation
+mid-path is a formatting error, not something to silently paper over), then
+score against the graph directly with four
+independent boolean checks (`metrics.evaluate_path`):
+
+1. **valid_path**: every node exists in the graph, no node repeats, and
+   every consecutive pair is an actual edge.
+2. **shortest_path**: `valid_path` AND the output's length equals the BFS
+   distance between its own two endpoints -- it doesn't have to match the
+   *stored* ground-truth path (several may exist), only genuinely be *a*
+   shortest path between wherever it says it starts and ends.
+3. **correct_length**: the output's length equals the graph's diameter.
+   Deliberately independent of validity -- a structurally wrong sequence
+   that happens to have the right length still scores here, which is useful
+   for distinguishing "the length head is right but the path head isn't"
+   from "nothing is right."
+4. **optimal_path**: `valid_path AND shortest_path AND correct_length` --
+   the output is a genuine diametric path of the graph (not necessarily
+   the specific path stored as ground truth, any one that qualifies).
+
+Rates over the eval batch are logged as `eval_id/*_rate` /
+`eval_ood/*_rate` (`final_eval_id/*` / `final_eval_ood/*` from
+`scripts/eval.py`, plus `wandb.summary` entries since those are one-off
+scores rather than a training-time series). `eval_num_examples` controls how
+many examples are scored per split (`-1` = full split); `eval_num_viz`
+(default 5, matching the task spec) controls how many of those are also
+rendered as images.
+
+Visualization (`viz.render_graph_path`, `networkx` for layout only) draws
+the full graph in gray, with the predicted path's edges/interior nodes
+highlighted and its first/last nodes marked distinctly, titled with the
+diameter and the four metric values; `wandb_images_for_examples` wraps each
+as a `wandb.Image` **captioned with the model's raw decoded text output**,
+per the task spec, and logs them under `eval_{id,ood}/samples`.
+
+## 9. Checkpointing & wandb resume (`spelf/checkpoint.py`, `spelf/train_state.py`)
+
+Checkpoints (`checkpoint_<step>.pt` under `output_dir`, `keep_last=3`
+retained) hold the model state dict, EMA params, optimizer state, LR
+scheduler state, step/epoch, the training RNG's state, and **the wandb run
+id**. That last field is the mechanism behind "saving and resuming synced
+with the wandb ID": `resolve_run` auto-detects the latest checkpoint in
+`output_dir` (or an explicit `--config_override resume=<path>`), and if one
+exists, `peek_wandb_run_id` reads its stored id *before* `wandb.init` is
+called, which then passes `id=<that id>, resume="allow"`. Resuming a run
+therefore reattaches to the exact same wandb run automatically -- nothing
+for the user to track by hand, unlike ELF's reference training script, which
+requires manually passing the same `--wandb_run_name` on every resume for
+its `id=` to line up. A fresh run (no checkpoint found) mints a new id via
+`generate_wandb_run_id()` (wraps `wandb.util.generate_id`, with a fallback
+for older/newer wandb versions where that moved), and it's saved into every
+checkpoint from that point on. `scripts/eval.py` reattaches the same way
+when `use_wandb` is on, so a standalone evaluation's summary metrics land in
+the training run's history rather than opening a disconnected run.
+
+One CPU-vs-device wrinkle worth flagging: `torch.Generator()` is CPU-only,
+but `load_checkpoint(..., device=...)` uses that same `device` as
+`map_location` for the whole checkpoint payload. The saved RNG state tensor
+is explicitly moved back to CPU (`.cpu()`) before `generator.set_state()`,
+which requires a CPU `ByteTensor` specifically --
+`tests/test_checkpoint.py::test_load_checkpoint_generator_state_survives_non_cpu_map_location`
+is a regression test for this (skipped when no non-CPU device is available).
+
+Resume granularity is epoch-level, not mid-epoch: `state.epoch` records
+*completed* epochs, and `save_freq < 1` (fractional, intra-epoch saving) is
+still supported, but resuming from a fractional-epoch checkpoint restarts
+that epoch from its beginning rather than replaying ELF's mid-epoch
+batch-skip logic. Since training data is IID-sampled per epoch anyway, this
+costs at most one epoch's worth of redundant compute on resume, in exchange
+for real simplicity -- worth it at this project's scale (default
+`save_freq=1`, whole epochs, where the distinction doesn't even arise).
+
+## 10. Configuration (`spelf/common.py::Config`)
+
+A single flat dataclass (rather than ELF's base-`Config` + YAML-overlay +
+separate `SamplingConfig` list), since this project has one model family and
+one task rather than ELF's several (OWT/WMT/XSum, three model sizes, a
+sampling-config sweep). Every field is documented inline in `common.py`
+next to its default, grouped by the same sections as this document (graphs,
+serialization, encoder, model, denoiser/decoder objective, conditioning/CFG,
+optimization, sampling, eval, logging/checkpointing, wandb, misc).
+`configs/default.yml` is a template overlay -- every field in it already
+matches the dataclass default; it exists to show which knobs are worth
+touching first, and as something to copy and edit for a new experiment.
+`--config_override field=value` (repeatable) on every script applies ad hoc
+overrides on top of a YAML file, coercing `value` to the field's current
+type.

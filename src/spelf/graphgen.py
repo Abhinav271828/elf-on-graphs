@@ -1,125 +1,164 @@
-"""Random connected graph sampling, diametric-pair enumeration, and deterministic
-shortest-path tie-breaking for the diametric-path task (find a path whose length
-equals the graph's diameter).
+"""Erdos-Renyi graph generation, BFS shortest paths, and diameter search.
 
-Graphs are always connected (by construction), so the diameter and every pairwise
-shortest path are always well-defined. Node labels are optionally drawn from a wider
-pool than the graph's own size (see `sample_graph`'s `label_pool_size`) so that ID and
-OOD graphs differ only in *size*, never in which node-id token values can appear.
+All graph math here is deterministic given a `random.Random` instance, and
+every "pick one among several equally valid answers" choice (which shortest
+path to report as ground truth, which diametric pair to use when several
+achieve the diameter) is resolved by an explicit, testable tie-break rule
+rather than left to iteration-order accident. See ARCHITECTURE.md
+("Graph generation & ground truth") for the full rationale.
 """
+
 from __future__ import annotations
 
-from typing import Optional
+import dataclasses
+import math
+from collections import deque
+from typing import Dict, List, Optional, Tuple
 
-import networkx as nx
-import numpy as np
-
-
-def _sample_graph_contiguous(n: int, avg_degree: float, rng: np.random.Generator, max_tries: int) -> nx.Graph:
-    """Erdos-Renyi graph on nodes 0..n-1, with p tuned for the target average degree,
-    reject-sampled until connected. Falls back to a random spanning tree + extra edges
-    (which can never fail to be connected) if the retry budget is exhausted -- this
-    keeps generation from ever hanging, though in practice p is comfortably above the
-    connectivity threshold for n in [6, 14] and the fallback is rarely hit."""
-    p = min(1.0, avg_degree / (n - 1))
-    for _ in range(max_tries):
-        edges = [(i, j) for i in range(n) for j in range(i + 1, n) if rng.random() < p]
-        G = nx.Graph()
-        G.add_nodes_from(range(n))
-        G.add_edges_from(edges)
-        if nx.is_connected(G):
-            return G
-    return _random_spanning_tree_fallback(n, avg_degree, rng)
+from .common import Config
 
 
-def sample_graph(n: int, avg_degree: float, rng: np.random.Generator, max_tries: int = 200,
-                  label_pool_size: Optional[int] = None) -> nx.Graph:
-    """Sample a connected graph with `n` nodes. If `label_pool_size` is given (e.g. the
-    tokenizer's MAX_NODES), the graph's nodes are labeled with a uniformly random
-    n-subset of {0, ..., label_pool_size-1} instead of contiguous 0..n-1 -- so every
-    node-id *token value* the model can be asked to emit gets exercised by graphs of
-    every size, and graph *size* (not label identity) is the only axis that
-    distinguishes ID from OOD. If `label_pool_size` is None (default), labels are
-    contiguous 0..n-1, matching the graph's own node count."""
-    G = _sample_graph_contiguous(n, avg_degree, rng, max_tries)
-    if label_pool_size is not None:
-        if label_pool_size < n:
-            raise ValueError(f"label_pool_size={label_pool_size} < n={n}")
-        chosen = rng.choice(label_pool_size, size=n, replace=False)
-        G = nx.relabel_nodes(G, {i: int(chosen[i]) for i in range(n)})
-    return G
+@dataclasses.dataclass(frozen=True)
+class Graph:
+    nodes: Tuple[int, ...]                 # sorted node ids, drawn from the full node universe
+    edges: Tuple[Tuple[int, int], ...]      # sorted (u, v) with u < v
+
+    def adjacency(self) -> Dict[int, List[int]]:
+        adj: Dict[int, List[int]] = {n: [] for n in self.nodes}
+        for u, v in self.edges:
+            adj[u].append(v)
+            adj[v].append(u)
+        for n in adj:
+            adj[n].sort()
+        return adj
 
 
-def _random_spanning_tree_fallback(n: int, avg_degree: float, rng: np.random.Generator) -> nx.Graph:
-    edges = set()
-    for i in range(1, n):
-        parent = int(rng.integers(0, i))
-        edges.add((parent, i))
-    target_edges = round(avg_degree * n / 2)
-    all_possible = [(i, j) for i in range(n) for j in range(i + 1, n) if (i, j) not in edges]
-    rng.shuffle(all_possible)
-    for e in all_possible:
-        if len(edges) >= target_edges:
-            break
-        edges.add(e)
-    G = nx.Graph()
-    G.add_nodes_from(range(n))
-    G.add_edges_from(edges)
-    return G
+@dataclasses.dataclass(frozen=True)
+class DiametricExample:
+    graph: Graph
+    source: int
+    target: int
+    path: Tuple[int, ...]   # canonical (lexicographically-smallest) diametric path
+    diameter: int            # == len(path) - 1, edges
 
 
-def shortest_path_lexsmallest(G: nx.Graph, start: int, end: int) -> list[int]:
-    """Deterministic shortest path: BFS distances *from end*, then greedily step from
-    `start` to the smallest-id neighbor whose distance-to-end is one less than the
-    current node's. This yields the lexicographically-smallest shortest path (every
-    candidate at each step lies on some shortest path, by the distance invariant, and
-    picking the smallest never forecloses a smaller full path later)."""
-    if start == end:
-        return [start]
-    dist = nx.shortest_path_length(G, source=end)
-    path = [start]
-    current = start
-    while current != end:
-        candidates = sorted(
-            w for w in G.neighbors(current) if dist.get(w) == dist[current] - 1
-        )
-        assert candidates, f"no progress from {current} toward {end} -- graph disconnected?"
-        current = candidates[0]
-        path.append(current)
+def bfs_distances(adjacency: Dict[int, List[int]], source: int) -> Dict[int, int]:
+    """Unweighted single-source shortest-path distances."""
+    dist = {source: 0}
+    queue = deque([source])
+    while queue:
+        u = queue.popleft()
+        for v in adjacency[u]:
+            if v not in dist:
+                dist[v] = dist[u] + 1
+                queue.append(v)
+    return dist
+
+
+def shortest_path(adjacency: Dict[int, List[int]], source: int, target: int) -> Optional[List[int]]:
+    """The lexicographically-smallest shortest path from source to target.
+
+    Among all min-length source-target paths, greedily walk from `source`
+    always choosing the smallest-id neighbor whose distance-to-target is one
+    less than the current node's -- this is a well-defined canonical choice
+    (independent of adjacency build order) so ground-truth data is
+    reproducible. Returns None if target is unreachable from source.
+    """
+    dist_to_target = bfs_distances(adjacency, target)
+    if source not in dist_to_target:
+        return None
+    path = [source]
+    cur = source
+    while cur != target:
+        remaining = dist_to_target[cur]
+        candidates = [v for v in adjacency[cur] if dist_to_target.get(v) == remaining - 1]
+        nxt = min(candidates)
+        path.append(nxt)
+        cur = nxt
     return path
 
 
-def graph_diameter(G: nx.Graph) -> int:
-    """The graph's diameter (max shortest-path distance over all pairs). Graphs here
-    are always connected by construction, so this is always well-defined."""
-    return nx.diameter(G)
+def is_connected(graph: Graph) -> bool:
+    if not graph.nodes:
+        return True
+    adj = graph.adjacency()
+    seen = bfs_distances(adj, graph.nodes[0])
+    return len(seen) == len(graph.nodes)
 
 
-def diametric_pairs(G: nx.Graph) -> list[tuple[int, int]]:
-    """All unordered {u, v} pairs (returned as (u, v) with u < v) whose shortest-path
-    distance equals the graph's diameter -- i.e. every pair a "diametric path" could
-    legitimately connect. A graph's diameter is always achieved by at least one pair,
-    and often by several (e.g. every antipodal pair on an even cycle)."""
-    lengths = dict(nx.all_pairs_shortest_path_length(G))
-    diam = max(max(d.values()) for d in lengths.values())
-    nodes = sorted(G.nodes())
-    pairs = []
-    for i, u in enumerate(nodes):
-        for v in nodes[i + 1:]:
-            if lengths[u].get(v) == diam:
-                pairs.append((u, v))
-    return pairs
+def find_diametric_example(graph: Graph) -> DiametricExample:
+    """Find the diameter and a canonical diametric (source, target, path).
+
+    Tie-break across all (s, t) pairs achieving the diameter: smallest s,
+    then smallest t (both scanned in sorted node order), so the choice is
+    deterministic and independent of adjacency/BFS traversal order.
+    """
+    adj = graph.adjacency()
+    nodes = graph.nodes
+    all_dist = {s: bfs_distances(adj, s) for s in nodes}
+
+    best_len, best_s, best_t = -1, None, None
+    for s in nodes:
+        for t in nodes:
+            if t == s:
+                continue
+            d = all_dist[s][t]
+            if d > best_len:
+                best_len, best_s, best_t = d, s, t
+
+    assert best_s is not None and best_t is not None, "graph must have >=2 nodes"
+    path = shortest_path(adj, best_s, best_t)
+    assert path is not None and len(path) - 1 == best_len
+    return DiametricExample(graph=graph, source=best_s, target=best_t,
+                             path=tuple(path), diameter=best_len)
 
 
-def sample_diametric_paths(G: nx.Graph, k: int, rng: np.random.Generator) -> list[list[int]]:
-    """Up to `k` canonical diametric paths -- one per distinct unordered diametric
-    pair, each computed via the deterministic `shortest_path_lexsmallest` tie-break. If
-    more than `k` diametric pairs exist, a random k-subset is used; if fewer, all of
-    them are returned (so a graph with a unique diametric pair contributes exactly one
-    path, not k duplicates). This is how "use multiple paths per graph if they exist"
-    is implemented for training data generation."""
-    pairs = diametric_pairs(G)
-    k = min(k, len(pairs))
-    idx = rng.choice(len(pairs), size=k, replace=False)
-    chosen = [pairs[i] for i in idx]
-    return [shortest_path_lexsmallest(G, u, v) for u, v in chosen]
+def _edge_probability(rng, n: int, config: Config) -> float:
+    if n <= 1:
+        return 0.0
+    threshold = math.log(n) / n
+    factor = rng.uniform(config.edge_prob_min_factor, config.edge_prob_max_factor)
+    p = factor * threshold
+    return min(max(p, config.edge_prob_floor), config.edge_prob_ceil)
+
+
+def sample_graph(rng, n_min: int, n_max: int, universe_size: int, config: Config) -> Graph:
+    """Sample a connected Erdos-Renyi graph G(n, p) with node ids drawn from
+    `range(universe_size)`.
+
+    Standard G(n, p) sampling can produce a disconnected graph; since a path
+    task requires connectivity (undefined diameter otherwise), we use
+    rejection sampling: redraw p and re-sample edges until connected, up to
+    `config.max_connect_attempts`. p is drawn per-attempt from a band above
+    the Erdos-Renyi connectivity threshold ln(n)/n, so rejections are rare in
+    practice. Graphs whose edge count exceeds `config.max_edges` are also
+    rejected, to bound the serialized sequence length.
+    """
+    n = rng.randint(n_min, n_max)
+    nodes = tuple(sorted(rng.sample(range(universe_size), n)))
+
+    for _ in range(config.max_connect_attempts):
+        p = _edge_probability(rng, n, config)
+        edges = [(nodes[i], nodes[j])
+                 for i in range(n) for j in range(i + 1, n)
+                 if rng.random() < p]
+        if len(edges) > config.max_edges:
+            continue
+        graph = Graph(nodes=nodes, edges=tuple(sorted(edges)))
+        if is_connected(graph):
+            return graph
+
+    raise RuntimeError(
+        f"Failed to sample a connected graph with n={n} in "
+        f"{config.max_connect_attempts} attempts; widen edge_prob_* bounds."
+    )
+
+
+def sample_id_example(rng, config: Config) -> DiametricExample:
+    graph = sample_graph(rng, config.id_min_nodes, config.id_max_nodes, config.ood_max_nodes, config)
+    return find_diametric_example(graph)
+
+
+def sample_ood_example(rng, config: Config) -> DiametricExample:
+    graph = sample_graph(rng, config.ood_min_nodes, config.ood_max_nodes, config.ood_max_nodes, config)
+    return find_diametric_example(graph)

@@ -1,79 +1,75 @@
-"""Muon (MomentUm Orthogonalized by Newton-Schulz), the optimizer the canonical ELF
-implementation uses for its decoder (arXiv:2605.10938, Section 4: "Muon optimizer with
-learning rate 0.002"). Verified against the paper before wiring in -- see the
-conversation that added this file for the exact check.
+"""A self-contained Muon optimizer (Newton-Schulz orthogonalized momentum for
+2D parameters, bias-corrected Nesterov-Adam for everything else), following
+the recipe ELF uses (`optax.contrib.muon`, ported to PyTorch on the
+`pytorch_elf` branch as `utils/muon_utils.py`).
 
-Muon is designed to optimize only a transformer's own >=2D "hidden" weight matrices
-(attention projections, MLP linears); embeddings, unembedding/classifier heads, and any
-1D parameter (biases, LayerNorm weight/bias) are conventionally left to a plain AdamW
-group instead -- Muon's orthogonalized-update semantics assume the parameter is a linear
-map between two continuous spaces, which doesn't fit an embedding table's per-row
-lookup semantics. `common.build_dlm_optimizer` is what actually splits a DLM's
-parameters between this optimizer and AdamW; this module only implements the
-optimizer itself, with no knowledge of any particular model's parameter names.
+This is a from-scratch, single-device reimplementation rather than a vendored
+copy of ELF's `muon_utils.py`, because that file wraps and monkey-patches an
+external `muon` PyPI package plus `torch.distributed` all-gather logic for
+multi-host training -- machinery this project has no use for at its scale.
+The algorithmic core (5-step Newton-Schulz orthogonalization in fp32,
+Nesterov momentum with bias correction, `sqrt(max(1, fan_out/fan_in))` shape
+scaling, non-2D params routed to Nesterov-Adam) is preserved exactly.
 """
+
 from __future__ import annotations
 
+from typing import Dict
+
 import torch
+import torch.nn as nn
 
 
-def _newton_schulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
-    """Approximately orthogonalize a 2D matrix via a quintic Newton-Schulz iteration:
-    starting from G (rescaled to unit Frobenius norm), repeatedly apply a fixed
-    quintic polynomial map (coefficients a,b,c tuned by Jordan et al. so the iteration
-    converges to an orthogonal matrix sharing G's singular vectors within a handful of
-    steps -- 5 is the standard choice, trading a closer-to-exact orthogonalization
-    against per-optimizer-step cost). Runs in bfloat16 purely for speed; the result is
-    cast back to G's own dtype before being returned. Operates on whichever of
-    (rows, cols) is smaller (transposing back afterward if needed) since the
-    per-iteration matmuls scale with the larger dimension otherwise."""
-    assert G.ndim == 2
+def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
+    """Orthogonalize G via Newton-Schulz iteration (quintic, fp32)."""
     a, b, c = 3.4445, -4.7750, 2.0315
-    X = G.bfloat16()
-    transpose = X.size(0) > X.size(1)
-    if transpose:
+    X = G.to(torch.float32)
+    transposed = X.size(-2) > X.size(-1)
+    if transposed:
         X = X.mT
-    X = X / (X.norm() + eps)
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-8)
     for _ in range(steps):
         A = X @ X.mT
         B = b * A + c * A @ A
         X = a * X + B @ X
-    if transpose:
+    if transposed:
         X = X.mT
-    return X.to(G.dtype)
+    return X
+
+
+def _nesterov_adam_update(grad, mu, nu, step, betas, eps):
+    b1, b2 = betas
+    mu.lerp_(grad, 1 - b1)
+    nu.lerp_(grad.square(), 1 - b2)
+    mu_hat = b1 * (mu / (1 - b1 ** (step + 1))) + (1 - b1) * (grad / (1 - b1 ** step))
+    nu_hat = nu / (1 - b2 ** step)
+    return mu_hat / (nu_hat.sqrt() + eps)
+
+
+def _muon_update(grad, momentum, step, beta=0.95, ns_steps=5, in_out_layout=False):
+    momentum.lerp_(grad, 1 - beta)
+    mu_hat = momentum / (1 - beta ** (step + 1))
+    g_hat = grad / (1 - beta ** step)
+    update = beta * mu_hat + (1 - beta) * g_hat
+    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+    m, n = grad.size(-2), grad.size(-1)
+    # nn.Linear.weight is stored (out, in) -> fan_out = m; a bare
+    # (in, out)-convention Parameter (e.g. dlm.ELF.proj_kernel) has
+    # fan_out = n. Flip the ratio accordingly.
+    if in_out_layout:
+        update = update * max(1, n / m) ** 0.5
+    else:
+        update = update * max(1, m / n) ** 0.5
+    return update
 
 
 class Muon(torch.optim.Optimizer):
-    """One Muon step: Nesterov momentum accumulation on the raw gradient, then the
-    momentum-adjusted update is orthogonalized via `_newton_schulz5` before being
-    applied -- rather than taking a step in the raw (co-)gradient direction, this takes
-    a step of the same shape but with all singular values pushed toward 1, so no single
-    direction in weight-space is over- or under-updated relative to the others. The
-    orthogonalized update is then rescaled by `max(1, rows/cols)**0.5`, an empirical
-    calibration (Jordan et al.) so one `lr` behaves reasonably across weight matrices of
-    different shapes -- without it, a wide matrix's orthogonalized update would have a
-    different effective RMS size than a tall one's. Weight decay is decoupled (applied
-    to the parameter directly, as in AdamW), not folded into the gradient.
+    """Muon for 2D params + Nesterov-Adam for everything else, single-device.
 
-    Every parameter passed to this optimizer must be >=2D -- see this class's module
-    docstring for why 1D/embedding parameters belong in a separate (AdamW) group
-    instead; passing one here raises immediately at construction rather than failing
-    obscurely inside `_newton_schulz5` partway through training.
+    Construct via `muon_with_aux_adam(model, lr)` rather than directly, so
+    the (out,in) vs (in,out) layout of every 2D parameter is detected
+    automatically.
     """
-
-    def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
-                 weight_decay: float = 0.0, nesterov: bool = True, ns_steps: int = 5):
-        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay,
-                         nesterov=nesterov, ns_steps=ns_steps)
-        super().__init__(params, defaults)
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.ndim < 2:
-                    raise ValueError(
-                        f"Muon only supports >=2D parameters, got shape {tuple(p.shape)} "
-                        f"-- route 1D/embedding parameters to a separate AdamW group instead "
-                        f"(see common.build_dlm_optimizer)"
-                    )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -82,22 +78,63 @@ class Muon(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
         for group in self.param_groups:
-            lr, momentum, wd = group["lr"], group["momentum"], group["weight_decay"]
             for p in group["params"]:
                 if p.grad is None:
-                    continue
-                g = p.grad
-                if g.ndim > 2:
-                    g = g.reshape(g.size(0), -1)
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                update = g.add(buf, alpha=momentum) if group["nesterov"] else buf
-                update = _newton_schulz5(update, steps=group["ns_steps"])
-                update = update * max(1.0, update.size(0) / update.size(1)) ** 0.5
-                if wd:
-                    p.mul_(1 - lr * wd)
-                p.add_(update.view_as(p), alpha=-lr)
+                    p.grad = torch.zeros_like(p)
+            if group["use_muon"]:
+                for p in group["params"]:
+                    state = self.state[p]
+                    if not state:
+                        state["momentum_buffer"] = torch.zeros_like(p)
+                        state["step"] = 0
+                    state["step"] += 1
+                    update = _muon_update(
+                        p.grad, state["momentum_buffer"], state["step"],
+                        beta=group["momentum"], in_out_layout=group["in_out_layout"].get(id(p), False),
+                    )
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+            else:
+                for p in group["params"]:
+                    state = self.state[p]
+                    if not state:
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                        state["step"] = 0
+                    state["step"] += 1
+                    update = _nesterov_adam_update(
+                        p.grad, state["exp_avg"], state["exp_avg_sq"],
+                        state["step"], group["betas"], group["eps"],
+                    )
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
         return loss
+
+
+def muon_with_aux_adam(model: nn.Module, lr: float, weight_decay: float = 0.0,
+                        muon_momentum: float = 0.95,
+                        adam_betas=(0.9, 0.999), adam_eps: float = 1e-8) -> Muon:
+    """Partition `model`'s trainable parameters: 2D -> Muon, else -> Adam.
+
+    Hyperparameters default to `optax.contrib.muon`'s (matching ELF).
+    """
+    linear_weight_ids = {id(m.weight) for m in model.modules() if isinstance(m, nn.Linear) and m.weight is not None}
+
+    muon_params, adam_params = [], []
+    in_out_layout: Dict[int, bool] = {}
+    for _name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim == 2:
+            muon_params.append(p)
+            in_out_layout[id(p)] = id(p) not in linear_weight_ids
+        else:
+            adam_params.append(p)
+
+    param_groups = [
+        dict(params=muon_params, lr=lr, momentum=muon_momentum, weight_decay=weight_decay,
+             use_muon=True, in_out_layout=in_out_layout),
+        dict(params=adam_params, lr=lr, betas=adam_betas, eps=adam_eps, weight_decay=weight_decay,
+             use_muon=False, in_out_layout={}),
+    ]
+    return Muon(param_groups, dict(lr=lr))

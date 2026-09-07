@@ -1,195 +1,212 @@
-"""ELF-style DLM decoder: continuous-embedding rectified-flow matching with x-prediction,
-two-branch denoise/decode training, self-conditioning, and CFG-dropout conditioning.
-Adapted from arXiv:2605.10938 ("Embedded Language Flows") to condition on a frozen
-graph encoder instead of a frozen T5 encoder, and to generate the fixed-length PATH
-target non-autoregressively (all L_TGT positions jointly) instead of free-form text.
+"""The ELF diffusion-LM transformer: a stack of RoPE/QK-norm/SwiGLU blocks
+operating in the frozen encoder's continuous embedding space, with a
+flow-matching output head (`final_layer`) and a factored CE decoder head
+(`proj_kernel`/`unembed_kernel`) sharing the same backbone. Ported from
+ELF's `pytorch_elf` branch (`src/modules/model.py`) with two changes:
+
+  1. Model sizes are rescaled way down (see `ELF_models` below) -- our
+     vocabulary (~20 tokens) and sequences (<=~200 positions) are a small
+     fraction of ELF's English/T5 setting.
+  2. `patch_size` is dropped (always 1 for text; ELF only uses it for other
+     modalities in the same codebase).
+
+Everything else -- the two-branch (decoder CE / denoiser L2) forward,
+prefix time/self-cond-cfg/model-mode tokens, self-conditioning input
+doubling, RoPE with unrotated prefix positions -- matches the reference.
 """
+
 from __future__ import annotations
+
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
-from . import tokenizer as tok
-from .modules import DecoderLayer, LearnedPosEnc, SharedEmbedding, TimeEmbedding
+from .modules import (
+    DEFAULT_BIAS_INIT, DEFAULT_KERNEL_INIT, NORMAL_INIT_002,
+    Attention, BottleneckTextProj, FinalLayer, RMSNorm, SwiGLUFFN,
+    TextRotaryEmbeddingFast, TimestepEmbedder, _make_linear,
+)
 
-DENOISE_MODE = 0
-DECODE_MODE = 1
 
-
-class DLMDecoder(nn.Module):
-    def __init__(self, l_tgt: int = tok.TARGET_LENGTH, d_model: int = 128, n_layers: int = 2,
-                 n_heads: int = 8, d_mlp: int = 512, dropout: float = 0.1,
-                 embedding: SharedEmbedding | None = None):
+class ELFBlock(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0,
+                 attn_drop: float = 0.0, proj_drop: float = 0.0):
         super().__init__()
-        self.l_tgt = l_tgt
-        self.d_model = d_model
-        self.embedding = embedding if embedding is not None else SharedEmbedding(d_model=d_model)
-        self.pos_enc = LearnedPosEnc(l_tgt, d_model)
-        self.time_emb = TimeEmbedding(d_model)
-        self.mode_emb = nn.Embedding(2, d_model)
-        self.input_proj = nn.Linear(2 * d_model, d_model)  # concat(z_t, self_cond) -> d_model
-        self.layers = nn.ModuleList(
-            [DecoderLayer(d_model, n_heads, d_mlp, dropout, causal=False) for _ in range(n_layers)]
-        )
-        self.out_ln = nn.LayerNorm(d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.null_context = nn.Parameter(torch.zeros(1, 1, d_model))
-        nn.init.normal_(self.null_context, std=0.02)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.norm1 = RMSNorm(hidden_size, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads, qkv_bias=True, qk_norm=True,
+                               attn_drop=attn_drop, proj_drop=proj_drop)
+        self.norm2 = RMSNorm(hidden_size, eps=1e-6)
+        self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
 
-    def forward(self, z_t: torch.Tensor, t: torch.Tensor, context: torch.Tensor,
-                context_mask: torch.Tensor, mode: torch.Tensor,
-                self_cond: torch.Tensor | None = None) -> torch.Tensor:
-        # z_t: [B, L_tgt, D]  t: [B]  context: [B, L_in, D]  context_mask: [B, L_in]
-        # mode: [B] long in {DENOISE_MODE, DECODE_MODE}
-        if self_cond is None:
-            self_cond = torch.zeros_like(z_t)
-        h = self.input_proj(torch.cat([z_t, self_cond], dim=-1))
-        h = self.pos_enc(h)
-        h = h + self.time_emb(t)[:, None, :]
-        h = h + self.mode_emb(mode)[:, None, :]
-        for layer in self.layers:
-            h = layer(h, context, context_mask)
-        h = self.out_ln(h)
-        return self.out_proj(h)  # x_hat, in embedding space
-
-    @torch.no_grad()
-    def generate(self, context: torch.Tensor, context_mask: torch.Tensor,
-                 num_steps: int = 32, guidance_scale: float = 1.0,
-                 use_self_cond: bool = False) -> torch.Tensor:
-        return sample(self, context, context_mask, num_steps=num_steps,
-                       guidance_scale=guidance_scale, use_self_cond=use_self_cond)
+    def forward(self, x, rope_fn=None, attention_mask=None, deterministic=True):
+        x = x + self.attn(self.norm1(x), rope_fn, attention_mask=attention_mask, deterministic=deterministic)
+        x = x + self.mlp(self.norm2(x), deterministic=deterministic)
+        return x
 
 
-def _apply_context_dropout(context: torch.Tensor, null_context: nn.Parameter,
-                            drop_prob: float) -> torch.Tensor:
-    B = context.shape[0]
-    drop_mask = torch.rand(B, device=context.device) < drop_prob
-    null = null_context.expand(B, context.shape[1], context.shape[2])
-    return torch.where(drop_mask[:, None, None], null, context)
+class ELF(nn.Module):
+    def __init__(
+        self,
+        text_encoder_dim: int,
+        max_length: int,
+        hidden_size: int = 256,
+        depth: int = 6,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        bottleneck_dim: int = 64,
+        num_time_tokens: int = 4,
+        num_self_cond_cfg_tokens: int = 4,
+        num_model_mode_tokens: int = 4,
+        vocab_size: int = 0,
+        gradient_checkpointing: bool = False,
+    ):
+        super().__init__()
+        self.text_encoder_dim = text_encoder_dim
+        self.max_length = max_length
+        self.hidden_size = hidden_size
+        self.depth = depth
+        self.num_heads = num_heads
+        self.num_time_tokens = num_time_tokens
+        self.num_self_cond_cfg_tokens = num_self_cond_cfg_tokens
+        self.num_model_mode_tokens = num_model_mode_tokens
+        self.vocab_size = vocab_size
+        self.gradient_checkpointing = gradient_checkpointing
+
+        self.self_cond_proj = _make_linear(2 * text_encoder_dim, text_encoder_dim, bias=True)
+        self.text_proj = BottleneckTextProj(text_encoder_dim, hidden_size, bottleneck_dim)
+
+        if num_time_tokens <= 0:
+            raise ValueError("num_time_tokens must be positive for prefix time conditioning")
+        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.t_emb_tokens = nn.Parameter(torch.empty(1, num_time_tokens, hidden_size))
+        NORMAL_INIT_002(self.t_emb_tokens)
+
+        if num_self_cond_cfg_tokens > 0:
+            self.self_cond_cfg_embedder = TimestepEmbedder(hidden_size)
+            self.self_cond_cfg_tokens = nn.Parameter(torch.empty(1, num_self_cond_cfg_tokens, hidden_size))
+            NORMAL_INIT_002(self.self_cond_cfg_tokens)
+
+        if num_model_mode_tokens > 0:
+            self.mode_tokens = nn.Parameter(torch.empty(1, num_model_mode_tokens, hidden_size))
+            NORMAL_INIT_002(self.mode_tokens)
+
+        head_dim = hidden_size // num_heads
+        prefix_total = num_model_mode_tokens + num_time_tokens
+        if num_self_cond_cfg_tokens > 0:
+            prefix_total += num_self_cond_cfg_tokens
+        self.feat_rope = TextRotaryEmbeddingFast(dim=head_dim, pt_seq_len=max_length, num_empty_token=prefix_total)
+
+        self.blocks = nn.ModuleList()
+        q1, q3 = depth // 4, depth // 4 * 3
+        for i in range(depth):
+            in_drop_range = q3 > i >= q1
+            self.blocks.append(ELFBlock(
+                hidden_size, num_heads, mlp_ratio=mlp_ratio,
+                attn_drop=attn_drop if in_drop_range else 0.0,
+                proj_drop=proj_drop if in_drop_range else 0.0,
+            ))
+
+        self.final_layer = FinalLayer(hidden_size, out_channels=text_encoder_dim)
+
+        bn = text_encoder_dim
+        self.proj_kernel = nn.Parameter(torch.empty(hidden_size, bn))
+        self.proj_bias = nn.Parameter(torch.empty(bn))
+        self.unembed_kernel = nn.Parameter(torch.empty(bn, vocab_size))
+        self.unembed_bias = nn.Parameter(torch.empty(vocab_size))
+        DEFAULT_KERNEL_INIT(self.proj_kernel)
+        DEFAULT_BIAS_INIT(self.proj_bias)
+        DEFAULT_KERNEL_INIT(self.unembed_kernel)
+        DEFAULT_BIAS_INIT(self.unembed_bias)
+
+    def build_context(self, t: torch.Tensor, self_cond_cfg_scale: Optional[torch.Tensor] = None) -> list:
+        B = t.shape[0]
+        prefix_tokens = [self.t_emb_tokens.expand(B, -1, -1) + self.t_embedder(t).unsqueeze(1)]
+        if self.num_self_cond_cfg_tokens > 0:
+            # The RoPE table's `num_empty_token` prefix budget is fixed at
+            # construction time assuming these tokens are always present
+            # when num_self_cond_cfg_tokens > 0 -- so unlike the other
+            # prefixes, this one isn't conditionally skippable per call.
+            if self_cond_cfg_scale is None:
+                raise ValueError(
+                    "self_cond_cfg_scale must be provided on every forward call "
+                    "when the model was built with num_self_cond_cfg_tokens > 0."
+                )
+            sc_emb = self.self_cond_cfg_embedder(self_cond_cfg_scale)
+            prefix_tokens.append(self.self_cond_cfg_tokens.expand(B, -1, -1) + sc_emb.unsqueeze(1))
+        return prefix_tokens
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        deterministic: bool = True,
+        self_cond_cfg_scale: Optional[torch.Tensor] = None,
+        decoder_step_active: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """x: (N, S, C) or (N, S, 2C) with self-cond. t: (N,). attention_mask: (N, S), 1=valid."""
+        B = x.shape[0]
+
+        if x.shape[-1] == 2 * self.text_encoder_dim:
+            x = self.self_cond_proj(x)
+        x = self.text_proj(x)
+        context_prefix_tokens = self.build_context(t, self_cond_cfg_scale)
+
+        model_mode_offset = 0
+        if self.num_model_mode_tokens > 0:
+            mode_tokens = self.mode_tokens.expand(B, -1, -1)
+            if decoder_step_active is None:
+                active_gate = 0.0
+            elif isinstance(decoder_step_active, torch.Tensor) and decoder_step_active.dim() > 0:
+                active_gate = decoder_step_active.to(mode_tokens.dtype).view(-1, 1, 1)
+            else:
+                active_gate = float(decoder_step_active)
+            mode_tokens = mode_tokens * active_gate
+            x = torch.cat([mode_tokens, x], dim=1)
+            model_mode_offset = self.num_model_mode_tokens
+            if attention_mask is not None:
+                mode_mask = torch.ones((B, self.num_model_mode_tokens), dtype=attention_mask.dtype, device=attention_mask.device)
+                attention_mask = torch.cat([mode_mask, attention_mask], dim=1)
+
+        prefix_len = 0
+        if context_prefix_tokens:
+            prefix_tokens = torch.cat(context_prefix_tokens, dim=1)
+            prefix_len = prefix_tokens.shape[1]
+            x = torch.cat([prefix_tokens, x], dim=1)
+            if attention_mask is not None:
+                prefix_mask = torch.ones((B, prefix_len), dtype=attention_mask.dtype, device=attention_mask.device)
+                attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
+
+        use_checkpoint = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
+        for block in self.blocks:
+            if use_checkpoint:
+                def _fwd(hidden, block=block):
+                    return block(hidden, rope_fn=self.feat_rope, attention_mask=attention_mask, deterministic=deterministic)
+                x = checkpoint(_fwd, x, use_reentrant=False)
+            else:
+                x = block(x, rope_fn=self.feat_rope, attention_mask=attention_mask, deterministic=deterministic)
+
+        x = x[:, prefix_len + model_mode_offset:]
+
+        decoder_logits = None
+        if decoder_step_active is not None:
+            hidden = F.gelu(x @ self.proj_kernel + self.proj_bias, approximate="tanh")
+            decoder_logits = hidden @ self.unembed_kernel + self.unembed_bias
+
+        output = self.final_layer(x)
+        return output, decoder_logits
 
 
-def loss(model: DLMDecoder, context: torch.Tensor, context_mask: torch.Tensor,
-          target_ids: torch.Tensor, cfg_dropout_prob: float = 0.1,
-          decode_branch_prob: float = 0.2, selfcond_prob: float = 0.0,
-          lambda_ce: float = 1.0, eps: float = 1e-5, pad_id: int = tok.PAD) -> dict:
-    """One training step's loss. Per-example branch assignment (denoise vs decode) is
-    sampled once per batch; both branches run through a single shared forward pass
-    (mode varies per example), then each example's loss term is routed to the matching
-    objective (reweighted MSE for denoise, cross-entropy for decode).
+# Model factory functions. See ARCHITECTURE.md ("Model sizing") for why
+# these are so much smaller than ELF-B/M/L.
+def ELF_XS(**kwargs): return ELF(depth=4, hidden_size=128, num_heads=4, **kwargs)
+def ELF_S(**kwargs):  return ELF(depth=6, hidden_size=192, num_heads=6, **kwargs)
+def ELF_M(**kwargs):  return ELF(depth=8, hidden_size=256, num_heads=8, **kwargs)
 
-    Both `denoise_loss` and `decode_loss` exclude `pad_id` positions (mean taken over
-    each example's own real, non-pad positions only, not the full L_TGT canvas) --
-    matching the canonical ELF reference implementation (github.com/lillian039/ELF,
-    src/train_step.py), verified directly against its source rather than assumed: it
-    builds one `loss_mask` from the batch's attention mask and applies that *same* mask
-    to both its L2/denoising loss (`reduce_token_loss`) and its CE/decode loss, when the
-    model uses a dedicated pad token distinct from EOS (this project's tokenizer always
-    does). The paper's own equations don't show this (Eq. 1/2 carry no masking
-    notation), so this detail only came from reading the actual code, not the paper.
-
-    Excluding pad from `denoise_loss` too means the model is never trained on what
-    embedding belongs at trailing positions past `<EOS>` -- deliberately: nothing needs
-    it to be `<PAD>` specifically, since decode_target/decode_t5_path_ids read a
-    generation by finding the first `<EOS>` and ignoring everything after it, not by
-    validating that the tail is literal padding (this parsing relaxation is the
-    necessary companion change -- without it, a DLM generation's untrained tail would
-    almost never happen to equal literal `<PAD>` by chance, and every generation would
-    be marked invalid regardless of whether its real content was correct). This is also
-    why full-canvas denoise supervision was wrong to keep in the first place: it was
-    spending capacity teaching the model an arbitrary convention nothing downstream
-    actually checks."""
-    B, L = target_ids.shape
-    device = target_ids.device
-
-    context = _apply_context_dropout(context, model.null_context, cfg_dropout_prob)
-
-    x = model.embedding(target_ids)  # [B, L, D] clean embeddings, the diffusion target
-
-    is_denoise = torch.rand(B, device=device) < (1 - decode_branch_prob)
-    t_denoise = torch.rand(B, device=device) * (1 - eps)
-    t_decode = 0.5 + torch.rand(B, device=device) * 0.5
-    t = torch.where(is_denoise, t_denoise, t_decode)
-    mode = (~is_denoise).long()  # DENOISE_MODE=0, DECODE_MODE=1
-
-    eps_noise = torch.randn_like(x)
-    z_t = t[:, None, None] * x + (1 - t[:, None, None]) * eps_noise
-
-    self_cond = torch.zeros_like(x)
-    if selfcond_prob > 0:
-        do_selfcond = torch.rand(B, device=device) < selfcond_prob
-        with torch.no_grad():
-            x_hat_prime = model(z_t, t, context, context_mask, mode, self_cond=torch.zeros_like(x))
-        self_cond = torch.where(do_selfcond[:, None, None], x_hat_prime, self_cond)
-
-    x_hat = model(z_t, t, context, context_mask, mode, self_cond=self_cond)
-
-    real_mask = (target_ids != pad_id).float()  # [B, L] -- shared by both branches, see docstring
-    n_real = real_mask.sum(dim=1).clamp(min=1)  # [B]
-
-    sq_err = (x_hat - x) ** 2  # [B, L, D]
-    weight = (1.0 / ((1 - t) ** 2 + eps))[:, None, None]
-    per_position_sq_err = (weight * sq_err).mean(dim=-1)  # [B, L], mean over D only
-    denoise_terms = (per_position_sq_err * real_mask).sum(dim=1) / n_real  # mean over real positions only
-
-    logits = model.embedding.unembed(x_hat)  # [B, L, vocab]
-    ce = F.cross_entropy(logits.transpose(1, 2), target_ids, ignore_index=pad_id, reduction="none")  # [B, L], 0 at pad_id positions
-    decode_terms = ce.sum(dim=1) / n_real  # mean over each example's own real (non-pad) positions only
-
-    denoise_mask = is_denoise.float()
-    decode_mask = (~is_denoise).float()
-    denoise_loss = (denoise_terms * denoise_mask).sum() / denoise_mask.sum().clamp(min=1)
-    decode_loss = (decode_terms * decode_mask).sum() / decode_mask.sum().clamp(min=1)
-    total = denoise_loss + lambda_ce * decode_loss
-
-    return {
-        "loss": total,
-        "denoise_loss": denoise_loss.detach(),
-        "decode_loss": decode_loss.detach(),
-        "n_denoise": int(is_denoise.sum().item()),
-        "n_decode": int((~is_denoise).sum().item()),
-    }
-
-
-@torch.no_grad()
-def sample(model: DLMDecoder, context: torch.Tensor, context_mask: torch.Tensor,
-           num_steps: int = 32, guidance_scale: float = 1.0, use_self_cond: bool = False,
-           eps: float = 1e-5) -> torch.Tensor:
-    """z_0 ~ N(0,I) over [L_tgt, D]; Euler-integrate dz/dt = v_theta for num_steps;
-    final decode-mode forward + argmax to get tokens. guidance_scale=1.0 disables CFG
-    (default, since generation here is always meant to be graph-conditioned, unlike the
-    paper's unconditional-generation use case) but is wired for sweeps.
-
-    use_self_cond should match whether the model was *trained* with selfcond_prob > 0
-    (see loss()) -- a model trained with self_cond always zeroed (vanilla, the default)
-    never learned to make use of a nonzero self-conditioning input, so feeding it one at
-    sampling time would just be off-distribution noise through input_proj, not a genuine
-    ablation-preserving no-op. When False (default), self_cond stays zero for every
-    step, matching vanilla training; when True, each step's prediction is chained into
-    the next step's self_cond, as in the ELF paper."""
-    B = context.shape[0]
-    device = context.device
-    z = torch.randn(B, model.l_tgt, model.d_model, device=device)
-    self_cond = torch.zeros(B, model.l_tgt, model.d_model, device=device)
-    mode_denoise = torch.full((B,), DENOISE_MODE, dtype=torch.long, device=device)
-    dt = 1.0 / num_steps
-    null = model.null_context.expand(B, context.shape[1], context.shape[2])
-
-    for step in range(num_steps):
-        t = torch.full((B,), step * dt, device=device)
-        x_hat_cond = model(z, t, context, context_mask, mode_denoise, self_cond=self_cond)
-        if guidance_scale != 1.0:
-            x_hat_uncond = model(z, t, null, context_mask, mode_denoise, self_cond=self_cond)
-            x_hat = guidance_scale * x_hat_cond + (1 - guidance_scale) * x_hat_uncond
-        else:
-            x_hat = x_hat_cond
-        v = (x_hat - z) / (1 - step * dt + eps)
-        z = z + v * dt
-        if use_self_cond:
-            self_cond = x_hat_cond
-
-    t_final = torch.full((B,), 1.0 - eps, device=device)
-    mode_decode = torch.full((B,), DECODE_MODE, dtype=torch.long, device=device)
-    x_hat_final = model(z, t_final, context, context_mask, mode_decode, self_cond=self_cond)
-    logits = model.embedding.unembed(x_hat_final)
-    return logits.argmax(dim=-1)
+ELF_models = {"ELF-XS": ELF_XS, "ELF-S": ELF_S, "ELF-M": ELF_M}

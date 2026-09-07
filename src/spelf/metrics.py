@@ -1,177 +1,164 @@
-"""Shared evaluation: decode raw generations back to graphs/paths (via tokenizer, the
-single source of truth) and score token accuracy, exact-match, valid-path, and
-diametric-optimality rates. Used identically for DLM and ARLM since both expose the
-same `model.generate(context, context_mask, **kwargs) -> [B, L_tgt]` interface -- the
-only per-model difference is what's in `sample_kwargs`.
+"""The four per-example eval metrics, plus the generation + scoring loop that
+runs the trained ELF model over a data split.
+
+Metrics (each a boolean per example; the task asks for all four, logged as
+their mean rate over the eval split):
+
+  1. valid_path      -- the decoded output is an actual path in the graph:
+                         every node exists, consecutive nodes are connected
+                         by an edge, and no node repeats.
+  2. shortest_path    -- the output is *a* shortest path between its own two
+                         endpoints (requires valid_path; length equals the
+                         BFS distance between predicted_path[0] and [-1]).
+  3. correct_length   -- the output's length (edge count) equals the graph's
+                         diameter. This is a pure length check, independent
+                         of validity -- a wrong-but-right-length output still
+                         scores here, which is deliberately informative
+                         (distinguishes "got the length right" from "got a
+                         real path at all").
+  4. optimal_path     -- valid_path AND shortest_path AND correct_length:
+                         the output is a genuine diametric path of the graph
+                         (any one of the graph's possibly-several diametric
+                         paths, not necessarily the specific one stored as
+                         ground truth).
 """
+
 from __future__ import annotations
 
 import random
-from typing import Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
-import networkx as nx
 import torch
 
-from . import common, tokenizer as tok
+from .common import Config
+from .dataset import PathDataset, get_dataloader, parse_path_text
+from .graphgen import Graph, bfs_distances
+from .sampling import decode_batch, generate_samples_single_batch, get_sampling_steps, mask_after_eos, shift_left
+from .t5_encoder import encode_text
+from .tokenizer import get_pad_id
+from .train_state import unwrap_model
 
 
-def _rebuild_graph(decoded_input: dict) -> nx.Graph:
-    G = nx.Graph()
-    # Node labels are drawn from a pool wider than [0, n) (see graphgen.sample_graph),
-    # so the real node set is node_list, not range(n) -- see viz.plot_example's matching
-    # comment. Doesn't change any current metric (has_edge/diameter over the real node
-    # set are unaffected by extra phantom nodes), but keeping this accurate avoids
-    # surprises for anything added later that iterates G's full node set.
-    G.add_nodes_from(decoded_input["node_list"])
-    G.add_edges_from(decoded_input["edges"])
-    return G
+def _is_valid_path(graph: Graph, path: Optional[List[int]]) -> bool:
+    if not path or len(path) < 2:
+        return False
+    node_set = set(graph.nodes)
+    if any(n not in node_set for n in path):
+        return False
+    if len(set(path)) != len(path):
+        return False
+    adj = graph.adjacency()
+    return all(v in adj[u] for u, v in zip(path, path[1:]))
 
 
-def evaluate_generation(input_ids_row: list[int], gen_ids_row: list[int], target_ids_row: list[int]) -> dict:
-    """Per-example metrics for one generated sequence vs ground truth."""
-    decoded_input = tok.decode_input(input_ids_row)
-    assert decoded_input is not None, "ground-truth input should always be well-formed"
-    G = _rebuild_graph(decoded_input)
-    diameter = nx.diameter(G)
+def evaluate_path(graph: Graph, predicted_path: Optional[List[int]], diameter: int) -> Dict[str, bool]:
+    valid = _is_valid_path(graph, predicted_path)
+    path_len = (len(predicted_path) - 1) if predicted_path else None
+    correct_length = path_len is not None and path_len == diameter
 
-    gen_path = tok.decode_target(gen_ids_row)
-    exact_match = gen_ids_row == target_ids_row
-
-    valid = False
-    shortest = False
-    correct_length = False
-    optimal = False
-    if gen_path:
-        valid = (
-            len(set(gen_path)) == len(gen_path)
-            and all(node in G for node in gen_path)
-            and all(G.has_edge(a, b) for a, b in zip(gen_path, gen_path[1:]))
-        )
-        if valid:
-            # Four increasingly strict conditions, each requiring `valid`:
-            #  - shortest: the path is actually the shortest path between its own two
-            #    endpoints (no shortcut exists) -- a necessary but not sufficient
-            #    condition for being a genuine diametric path, since a path can be
-            #    shortest between its endpoints while those endpoints aren't a
-            #    diametric pair (their distance is less than the graph's diameter).
-            #  - correct_length: the path's edge-length equals the graph's diameter --
-            #    also not sufficient alone, since a *non-shortest* walk between two
-            #    close-together nodes could coincidentally have `diameter` edges.
-            #  - optimal: both at once, i.e. the path is a genuine shortest path
-            #    between its endpoints AND that shared length equals the diameter --
-            #    equivalent to "the endpoints are a diametric pair and this is a
-            #    shortest path between them", which is exactly what a diametric path
-            #    is by definition.
-            shortest = (len(gen_path) - 1 == nx.shortest_path_length(G, gen_path[0], gen_path[-1]))
-            correct_length = (len(gen_path) - 1 == diameter)
-            optimal = shortest and correct_length
-
-    token_accuracy = sum(a == b for a, b in zip(gen_ids_row, target_ids_row)) / len(target_ids_row)
-
-    # Same idea as arlm.loss's train-time token_accuracy: mask out positions the target
-    # itself pads (<PAD> is trivial to predict once <EOS> has been emitted, and for OOD's
-    # longer L_TGT canvas a large fraction of positions are padding -- diluting the plain
-    # token_accuracy above well above valid_rate/optimal_rate even for near-miss
-    # generations). Masks by the TARGET's <PAD> positions, not the generation's own, so a
-    # generation that mispredicts where <EOS>/<PAD> starts is still penalized correctly.
-    real_positions = [i for i, t in enumerate(target_ids_row) if t != tok.PAD]
-    token_accuracy_nopad = (
-        sum(gen_ids_row[i] == target_ids_row[i] for i in real_positions) / len(real_positions)
-        if real_positions else 1.0
-    )
+    is_shortest = False
+    if valid:
+        s, t = predicted_path[0], predicted_path[-1]
+        dist = bfs_distances(graph.adjacency(), s).get(t)
+        is_shortest = dist is not None and path_len == dist
 
     return {
-        "token_accuracy": token_accuracy,
-        "token_accuracy_nopad": token_accuracy_nopad,
-        "exact_match": exact_match,
-        "valid": valid,
-        "shortest": shortest,
+        "valid_path": valid,
+        "shortest_path": is_shortest,
         "correct_length": correct_length,
-        "optimal": optimal,
-        "diameter": diameter,
-        "gen_path": gen_path,
-        "decoded_input": decoded_input,
+        "optimal_path": valid and is_shortest and correct_length,
     }
 
 
-def sample_examples(examples: list[dict], k: int) -> list[dict]:
-    """A different random k-subset of `examples` on every call -- used to pick which
-    examples get logged as wandb images each eval round, instead of always slicing the
-    same examples[:k]. Once those first few examples are solved, a fixed slice stops
-    showing whether the model is still improving on the rest of the (sub-sampled) val
-    set; a fresh random draw each round keeps the visualizations informative. Uses the
-    process's global `random` state (already seeded once via common.set_seed at
-    startup), so a run's full sequence of picks is still reproducible run-to-run under a
-    fixed --seed, it just varies step-to-step within a run -- see viz.py."""
-    return random.sample(examples, min(k, len(examples)))
+@dataclass
+class EvalExample:
+    input_text: str
+    target_text: str
+    predicted_text: str
+    graph: Graph
+    diameter: int
+    predicted_path: Optional[List[int]]
+    metrics: Dict[str, bool]
 
 
 @torch.no_grad()
-def run_eval(
-    decoder,
-    encoder,
-    loader,
-    device: torch.device,
-    sample_kwargs: Optional[dict] = None,
-    max_batches: Optional[int] = None,
-) -> dict:
-    """decoder: DLMDecoder or GPTDecoder (anything with .generate(context, context_mask,
-    **sample_kwargs)). encoder: frozen GraphEncoder or T5GraphEncoder (see
-    common.encode_context). Returns aggregate rates plus a list of per-example dicts (for
-    the caller to pick a few for visualization). Four nested-strictness rates, each
-    computed only over generations decoding to a well-formed path (see
-    evaluate_generation for exact definitions):
-      - valid_rate: decodes to a genuine simple path using real edges of the graph.
-      - shortest_rate: is actually the shortest path between its own two endpoints.
-      - correct_length_rate: its edge-length equals the graph's diameter.
-      - optimal_rate: both at once, i.e. a genuine diametric path -- this is the
-        "id_optimal rate" when called on the ID loader (the fraction of graphs for which
-        the model found any true diametric path), the primary early-stopping signal."""
-    decoder.eval()
-    encoder.eval()
-    sample_kwargs = sample_kwargs or {}
+def run_eval(model: torch.nn.Module, encoder: torch.nn.Module, tokenizer,
+             raw_examples: List[dict], config: Config, device: torch.device,
+             generator: torch.Generator, num_examples: int, batch_size: int) -> List[EvalExample]:
+    """Generate + score up to `num_examples` examples from `raw_examples`.
 
-    totals = {
-        "token_accuracy": 0.0, "token_accuracy_nopad": 0.0, "exact_match": 0,
-        "valid": 0, "shortest": 0, "correct_length": 0, "optimal": 0, "n": 0,
-    }
-    examples: list[dict] = []
+    A model in eval mode is expected (callers typically pass an EMA-weight
+    copy; see checkpoint.py / scripts/eval.py).
+    """
+    if num_examples > 0:
+        raw_examples = raw_examples[:num_examples]
+    dataset = PathDataset(raw_examples, tokenizer)
+    pad_id = get_pad_id(tokenizer, config.pad_token)
+    dataloader = get_dataloader(dataset, config, tokenizer, batch_size=batch_size, shuffle=False, drop_last=False)
 
-    for bi, batch in enumerate(loader):
-        if max_batches is not None and bi >= max_batches:
-            break
-        input_ids = batch["input_ids"].to(device)
-        input_mask = batch["input_mask"].to(device)
-        target_ids = batch["target_ids"].to(device)
+    d_model = unwrap_model(model).text_encoder_dim
+    dtype = next(model.parameters()).dtype
+    eos_id = tokenizer.eos_token_id
 
-        context, context_mask = common.encode_context(encoder, input_ids, input_mask)
-        gen = decoder.generate(context, context_mask, **sample_kwargs)
+    results: List[EvalExample] = []
+    for batch in dataloader:
+        bsz = batch["input_ids"].shape[0]
+        input_ids = batch["input_ids"].to(device).long()
+        encoder_attention_mask = batch["encoder_attention_mask"].to(device, dtype=torch.float32)
+        cond_seq_mask = batch["cond_seq_mask"].to(device, dtype=torch.float32)
+        cond_len = batch["cond_len"].to(device)
 
-        gen_cpu = gen.cpu().tolist()
-        tgt_cpu = target_ids.cpu().tolist()
-        inp_cpu = input_ids.cpu().tolist()
+        cond_seq = encode_text(input_ids=input_ids, attention_mask=encoder_attention_mask,
+                                encoder=encoder, latent_mean=config.latent_mean, latent_std=config.latent_std).to(dtype)
 
-        for i in range(len(gen_cpu)):
-            m = evaluate_generation(inp_cpu[i], gen_cpu[i], tgt_cpu[i])
-            totals["token_accuracy"] += m["token_accuracy"]
-            totals["token_accuracy_nopad"] += m["token_accuracy_nopad"]
-            totals["exact_match"] += int(m["exact_match"])
-            totals["valid"] += int(m["valid"])
-            totals["shortest"] += int(m["shortest"])
-            totals["correct_length"] += int(m["correct_length"])
-            totals["optimal"] += int(m["optimal"])
-            totals["n"] += 1
-            examples.append({**m, "input_ids": inp_cpu[i], "gen_ids": gen_cpu[i], "target_ids": tgt_cpu[i]})
+        t_steps = get_sampling_steps(config.num_sampling_steps, config.sampling_time_schedule,
+                                      config.denoiser_p_mean, config.denoiser_p_std, device=device, dtype=dtype)
+        z = torch.randn((bsz, config.max_length, d_model), generator=generator, dtype=dtype).to(device) * config.denoiser_noise_scale
 
-    n = max(totals["n"], 1)
+        latent = generate_samples_single_batch(
+            model=model, generator=generator, z=z, t_steps=t_steps,
+            cond_seq=cond_seq, cond_seq_mask=cond_seq_mask, config=config,
+            cfg_scale=config.cfg_scale, self_cond_cfg_scale=config.self_cond_cfg_scale,
+            sampling_method=config.sampling_method, sde_gamma=config.sde_gamma,
+        )
+        predicted_ids = decode_batch(latent, model, t_steps[-1].item(), config, config.self_cond_cfg_scale)
+        predicted_ids = shift_left(predicted_ids, cond_len, pad_value=pad_id)
+        gen_length = config.max_length - config.max_input_length
+        predicted_ids = predicted_ids[:, :gen_length]
+        predicted_ids = mask_after_eos(predicted_ids, eos_id=eos_id, pad_id=pad_id)
+
+        for i in range(bsz):
+            idx = batch["index"][i]
+            raw = raw_examples[idx]
+            graph = Graph(nodes=tuple(raw["nodes"]), edges=tuple(tuple(e) for e in raw["edges"]))
+            pred_text = tokenizer.decode(predicted_ids[i].detach().cpu().tolist(), skip_special_tokens=True)
+            predicted_path = parse_path_text(pred_text)
+            metrics = evaluate_path(graph, predicted_path, raw["diameter"])
+            results.append(EvalExample(
+                input_text=batch["input"][i], target_text=batch["target"][i],
+                predicted_text=pred_text, graph=graph, diameter=raw["diameter"],
+                predicted_path=predicted_path, metrics=metrics,
+            ))
+    return results
+
+
+def aggregate_metrics(results: List[EvalExample]) -> Dict[str, float]:
+    if not results:
+        return {"valid_path_rate": 0.0, "shortest_path_rate": 0.0, "correct_length_rate": 0.0,
+                "optimal_path_rate": 0.0, "num_examples": 0}
+    n = len(results)
     return {
-        "token_accuracy": totals["token_accuracy"] / n,
-        "token_accuracy_nopad": totals["token_accuracy_nopad"] / n,
-        "exact_match_rate": totals["exact_match"] / n,
-        "valid_rate": totals["valid"] / n,
-        "shortest_rate": totals["shortest"] / n,
-        "correct_length_rate": totals["correct_length"] / n,
-        "optimal_rate": totals["optimal"] / n,
-        "n_examples": totals["n"],
-        "examples": examples,
+        "valid_path_rate": sum(r.metrics["valid_path"] for r in results) / n,
+        "shortest_path_rate": sum(r.metrics["shortest_path"] for r in results) / n,
+        "correct_length_rate": sum(r.metrics["correct_length"] for r in results) / n,
+        "optimal_path_rate": sum(r.metrics["optimal_path"] for r in results) / n,
+        "num_examples": n,
     }
+
+
+def pick_viz_examples(results: List[EvalExample], k: int, seed: int = 0) -> List[EvalExample]:
+    if len(results) <= k:
+        return list(results)
+    rng = random.Random(seed)
+    return rng.sample(results, k)
